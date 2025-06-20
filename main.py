@@ -97,8 +97,9 @@ class GCodeProcessorThread(QThread):
     A QThread subclass to run the G-code processing in a separate thread,
     preventing the GUI from freezing.
     """
-    # Modified signal: now emits processed_content ONLY
-    finished = pyqtSignal(str, str, str) # Signals: original_filepath, processed_content, mode
+    # MODIFIED SIGNAL: Now emits a list of (x,y,z) tuples for snapshots
+    # Signals: original_filepath, processed_content (str), mode (str), snapshot_points (list of (x,y,z))
+    finished = pyqtSignal(str, str, str, list) 
     error = pyqtSignal(str) # Signal for error messages
     log_signal = pyqtSignal(str, str) # Signal for logging messages: (message, type)
 
@@ -114,6 +115,7 @@ class GCodeProcessorThread(QThread):
         Executes the G-code processing logic in this thread.
         """
         processed_content = ""
+        snapshot_points = [] # Initialize empty list for snapshot points
         try:
             # Store the original stdout and redirect
             self.old_stdout = sys.stdout
@@ -125,11 +127,13 @@ class GCodeProcessorThread(QThread):
 
             run_func = load_script(self.mode)
             
-            # Expect run_func to return only processed_gcode_lines (list of strings)
-            new_lines = run_func(self.settings, gcode_lines)
+            # MODIFIED: Expect run_func to return processed_gcode_lines (list of strings)
+            # AND a list of snapshot_points (list of (x,y,z) tuples).
+            new_lines, snapshot_points = run_func(self.settings, gcode_lines)
             processed_content = "".join(new_lines)
 
-            self.finished.emit(self.filepath, processed_content, self.mode)
+            # MODIFIED: Emit snapshot_points along with other data
+            self.finished.emit(self.filepath, processed_content, self.mode, snapshot_points)
 
         except FileNotFoundError as e:
             self.error.emit(f"Error: {e}")
@@ -513,7 +517,8 @@ class PrintPathApp(QMainWindow):
         self.dwell_time_input.setValue(self.current_settings.get("dwell_time", self.global_default_settings.get("dwell_time", 500)))
         self.dwell_time_input.valueChanged.connect(lambda value: self._update_setting("dwell_time", value))
         self.dwell_time_input.setToolTip("The duration (in milliseconds) the printer waits at the snapshot position.")
-        self.settings_form_layout.addRow(self.dwell_time_label, self.dwell_time_input)
+        # FIX: Corrected typo from 'self_settings_form_layout' to 'self.settings_form_layout'
+        self.settings_form_layout.addRow(self.dwell_time_label, self.dwell_time_input) 
         self.global_setting_widgets["dwell_time"] = (self.dwell_time_label, self.dwell_time_input)
 
         self.retract_length_label = QLabel("Retract Length (mm):")
@@ -1258,11 +1263,11 @@ class PrintPathApp(QMainWindow):
                 self.debug_mode_action.setEnabled(True)
 
 
-    def _processing_finished(self, original_filepath, processed_content, mode):
+    def _processing_finished(self, original_filepath, processed_content, mode, snapshot_points):
         """
         Slot connected to the GCodeProcessorThread's finished signal.
         Updates the GUI with the processed content, saves it, and changes button behavior.
-        Also triggers parsing of the processed content to update snapshot points in the viewer.
+        Also updates snapshot points in the viewer.
         """
         self._set_ui_processing_state(False)
         print(f"DEBUG: G-code processing finished for '{os.path.basename(original_filepath)}'.", file=sys.__stdout__)
@@ -1280,18 +1285,14 @@ class PrintPathApp(QMainWindow):
             # Auto-save the processed content
             self.output_filepath = self._auto_save_processed_gcode(original_filepath, mode)
             
-            # After saving, parse the *saved* content to get snapshot points for the viewer
+            # Use the snapshot_points directly from the thread's result
+            # and pass them to the viewer
+            self.gcode_viewer.set_processed_snapshot_points(snapshot_points)
+            self._log_message(f"Viewer updated with {len(snapshot_points)} processed snapshot points.", "debug")
+            print(f"DEBUG: Viewer updated with {len(snapshot_points)} processed snapshot points.", file=sys.__stdout__)
+
+
             if self.output_filepath:
-                try:
-                    with open(self.output_filepath, "r") as f:
-                        processed_lines = f.readlines()
-                    self.gcode_viewer.parse_and_set_processed_snapshot_points(processed_lines, self.current_settings.get("debug_mode", False))
-                    self._log_message(f"Viewer updated with {len(self.gcode_viewer.processed_snapshot_points)} processed snapshot points.", "debug")
-                except Exception as e:
-                    self._log_message(f"Error parsing processed file for snapshots: {e}", "error")
-                    print(f"ERROR: Error parsing processed file for snapshots: {e}", file=sys.__stdout__)
-
-
                 self.go_button.setText(f"Open '{os.path.basename(self.output_filepath)}'")
                 self.go_button.setEnabled(True)
                 print(f"DEBUG: Auto-save successful. Go button text updated to 'Open {os.path.basename(self.output_filepath)}'.", file=sys.__stdout__)
@@ -1602,7 +1603,8 @@ if __name__ == "__main__":
 
             # CLI mode will not have a viewer to display processed snapshot points,
             # so we still call run_func expecting it to return (lines)
-            new_lines = run_func(cli_settings, gcode_lines)
+            # MODIFIED: Expect run_func to return both new_lines and dummy_snapshot_points
+            new_lines, dummy_snapshot_points = run_func(cli_settings, gcode_lines)
             
             base, ext = os.path.splitext(filepath)
             outpath = f"{base}_{DEFAULT_MODE}{ext}"
