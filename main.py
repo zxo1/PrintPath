@@ -31,6 +31,8 @@ APP_VERSION = "1.0.0"
 MIN_BED_DIMENSION = 50.0 # Minimum reasonable bed dimension in mm
 DEFAULT_BED_X = 220.0
 DEFAULT_BED_Y = 220.0
+# New constant: Minimum acceptable dimension for a *model* bounding box (to distinguish from prime lines/skirts)
+MIN_MODEL_DIMENSION_THRESHOLD = 50.0 
 
 
 def load_script(mode):
@@ -154,8 +156,8 @@ class GCodeParseThread(QThread):
     A QThread subclass for parsing G-code file content to extract
     bed dimensions and toolpath data for the previewer.
     """
-    # Modified signal: now emits a list of (QPointF(x,y), z_value) tuples
-    finished = pyqtSignal(dict, list, list) # Signals: gcode_info, toolpath_data, layer_start_points
+    # MODIFIED signal: now emits toolpath_bounds dict
+    finished = pyqtSignal(dict, list, list, dict) # Signals: gcode_info, toolpath_data, layer_start_points, toolpath_bounds
     error = pyqtSignal(str) # Signal for error messages
     log_signal = pyqtSignal(str, str) # Signal for logging messages: (message, type)
 
@@ -173,7 +175,8 @@ class GCodeParseThread(QThread):
             # Redirect stdout for this thread's logs
             self.old_stdout = sys.stdout
             # Pass sys.__stderr__ explicitly to StreamRedirect
-            sys.stdout = StreamRedirect(self.log_signal, "debug", self.old_stdout, sys.__stderr__) # Always debug for parsing thread
+            # Parsing always logs debug info for analysis
+            sys.stdout = StreamRedirect(self.log_signal, "debug", self.old_stdout, sys.__stderr__) 
 
             self.log_signal.emit(f"Parsing G-code file: {os.path.basename(self.filepath)}", "info")
 
@@ -181,9 +184,11 @@ class GCodeParseThread(QThread):
                 gcode_lines = f.readlines()
             
             gcode_info = self._parse_gcode_info_main_app(gcode_lines)
-            toolpath_data, layer_start_points = self._parse_gcode_toolpath(gcode_lines) # Now returns toolpath and layer points
+            # MODIFIED: _parse_gcode_toolpath now returns toolpath_bounds
+            toolpath_data, layer_start_points, toolpath_bounds = self._parse_gcode_toolpath(gcode_lines)
 
-            self.finished.emit(gcode_info, toolpath_data, layer_start_points)
+            # MODIFIED: Emit toolpath_bounds along with other data
+            self.finished.emit(gcode_info, toolpath_data, layer_start_points, toolpath_bounds)
 
         except FileNotFoundError:
             self.error.emit(f"Error: File not found at {self.filepath}")
@@ -201,8 +206,7 @@ class GCodeParseThread(QThread):
         This is a more comprehensive parser than the one in scripts.
         """
         info = {
-            "gcode_flavor": None,
-            "total_layers": None,
+            "total_layers": None, "gcode_flavor": None,
             "min_x": None, "max_x": None,
             "min_y": None, "max_y": None,
             "max_z": None,
@@ -220,7 +224,7 @@ class GCodeParseThread(QThread):
                     flavor = match.group(1).lower()
                     if flavor in ["klipper", "marlin"]:
                         info["gcode_flavor"] = flavor
-                        self.log_signal.emit(f"Line {line_num + 1}: Detected G-code flavor: {flavor}", "debug")
+                        # self.log_signal.emit(f"Line {line_num + 1}: Detected G-code flavor: {flavor}", "debug") # Removed verbose debug
             
             # Total layers
             if info["total_layers"] is None:
@@ -236,12 +240,12 @@ class GCodeParseThread(QThread):
                     try: info["total_layers"] = int(line_upper.split(":")[1].strip()) + 1
                     except ValueError: pass
                 if info["total_layers"] is not None:
-                    self.log_signal.emit(f"Line {line_num + 1}: Detected total layers: {info['total_layers']}", "debug")
+                    # self.log_signal.emit(f"Line {line_num + 1}: Detected total layers: {info['total_layers']}", "debug") # Removed verbose debug
+                    pass
 
 
-            # Object Bounding Box
+            # Object Bounding Box (Initial comment-based parsing, can be overridden by toolpath later)
             if info["min_x"] is None:
-                # Try POLYGON format
                 exclude_obj_match = re.search(r"POLYGON=\[\[([-+]?\d*\.?\d+),([-+]?\d*\.?\d+)\],\[([-+]?\d*\.?\d+),([-+]?\d*\.?\d+)\],\[([-+]?\d*\.?\d+),([-+]?\d*\.?\d+)\],\[([-+]?\d*\.?\d+),([-+]?\d*\.?\d+)\]", line, re.IGNORECASE)
                 if exclude_obj_match:
                     try:
@@ -252,13 +256,12 @@ class GCodeParseThread(QThread):
                         info["max_x"] = max(xs)
                         info["min_y"] = min(ys)
                         info["max_y"] = max(ys)
-                        self.log_signal.emit(f"Line {line_num + 1}: Detected object bbox via POLYGON: X[{info['min_x']}:{info['max_x']}] Y[{info['min_y']}:{info['max_y']}]", "debug")
+                        # self.log_signal.emit(f"Line {line_num + 1}: Detected object bbox via POLYGON: X[{info['min_x']:.4f}:{info['max_x']:.4f}] Y[{info['min_y']:.4f}:{info['max_y']:.4f}]", "debug") # Removed verbose debug
                     except ValueError:
                         self.log_signal.emit(f"Line {line_num + 1}: Error parsing POLYGON coordinates.", "debug")
                         pass
 
             if info["min_x"] is None: 
-                # Try generic BBOX format
                 bbox_match = re.search(r"X\[([-+]?\d*\.?\d+):([-+]?\d*\.?\d+)\]\s*Y\[([-+]?\d*\.?\d+):([-+]?\d*\.?\d+)\](?:\s*Z\[([-+]?\d*\.?\d+):([-+]?\d*\.?\d+)\])?", line, re.IGNORECASE)
                 if bbox_match:
                     try:
@@ -268,7 +271,7 @@ class GCodeParseThread(QThread):
                         info["max_y"] = float(bbox_match.group(4)) 
                         if bbox_match.group(5) and bbox_match.group(6):
                             info["max_z"] = float(bbox_match.group(6)) 
-                        self.log_signal.emit(f"Line {line_num + 1}: Detected object bbox: X[{info['min_x']}:{info['max_x']}] Y[{info['min_y']}:{info['max_y']}] Z[{info.get('min_z', 'N/A')}:{info.get('max_z', 'N/A')}]", "debug")
+                        # self.log_signal.emit(f"Line {line_num + 1}: Detected object bbox: X[{info['min_x']:.4f}:{info['max_x']:.4f}] Y[{info['min_y']:.4f}:{info['max_y']:.4f}] Z[{info.get('min_z', 'N/A')}:{info.get('max_z', 'N/A')}]", "debug") # Removed verbose debug
                     except ValueError: 
                         self.log_signal.emit(f"Line {line_num + 1}: Error parsing bbox coordinates.", "debug")
                         pass
@@ -279,7 +282,7 @@ class GCodeParseThread(QThread):
                 if max_z_match: 
                     try:
                         info["max_z"] = float(max_z_match.group(1))
-                        self.log_signal.emit(f"Line {line_num + 1}: Detected max_z: {info['max_z']}", "debug")
+                        # self.log_signal.emit(f"Line {line_num + 1}: Detected max_z: {info['max_z']}", "debug") # Removed verbose debug
                     except ValueError:
                         self.log_signal.emit(f"Line {line_num + 1}: Error parsing max_z value.", "debug")
                         pass
@@ -307,7 +310,7 @@ class GCodeParseThread(QThread):
                             y_dim = DEFAULT_BED_Y
                         
                         info["bed_dimensions"] = {"x": x_dim, "y": y_dim}
-                        self.log_signal.emit(f"Line {line_num + 1}: Final bed dimensions set to: {info['bed_dimensions']['x']}x{info['bed_dimensions']['y']}", "debug")
+                        # self.log_signal.emit(f"Line {line_num + 1}: Final bed dimensions set to: {info['bed_dimensions']['x']}x{info['bed_dimensions']['y']}", "debug") # Removed verbose debug
 
                     except ValueError:
                         self.log_signal.emit(f"Line {line_num + 1}: Error parsing bed dimensions from '{line.strip()}'.", "debug")
@@ -330,7 +333,7 @@ class GCodeParseThread(QThread):
                                 y_dim = DEFAULT_BED_Y
                             
                             info["bed_dimensions"] = {"x": x_dim, "y": y_dim}
-                            self.log_signal.emit(f"Line {line_num + 1}: Final bed dimensions set from printable_area: {info['bed_dimensions']['x']}x{info['bed_dimensions']['y']}", "debug")
+                            # self.log_signal.emit(f"Line {line_num + 1}: Final bed dimensions set from printable_area: {info['bed_dimensions']['x']}x{info['bed_dimensions']['y']}", "debug") # Removed verbose debug
                         except ValueError:
                             self.log_signal.emit(f"Line {line_num + 1}: Error parsing printable_area dimensions from '{line.strip()}'.", "debug")
                             pass
@@ -340,7 +343,7 @@ class GCodeParseThread(QThread):
             if all(info[k] is not None for k in ["total_layers", "min_x", "max_x", "min_y", "max_y", "max_z", "gcode_flavor"]):
                 if info["bed_dimensions"] is not None and \
                    info["bed_dimensions"]["x"] >= MIN_BED_DIMENSION and info["bed_dimensions"]["y"] >= MIN_BED_DIMENSION:
-                    self.log_signal.emit(f"Line {line_num + 1}: All primary info (layers, bbox, flavor, valid bed) found. Stopping parsing early.", "debug")
+                    # self.log_signal.emit(f"All primary info (layers, bbox, flavor, valid bed) found. Stopping parsing early.", "debug") # Removed verbose debug
                     break 
                 
         # Final fallback for bed dimensions if not found or still invalid after loop
@@ -364,6 +367,8 @@ class GCodeParseThread(QThread):
         Returns a list of tuples: [(QPointF(x, y), z_value), ...].
         Handles G90 (absolute) and G91 (relative) positioning.
         Additionally, identifies potential layer start points for snapshots.
+        
+        MODIFIED: Also returns the min/max X/Y/Z bounds derived from the actual toolpath.
         """
         toolpath_points = [] # Stores (QPointF(x,y), z) tuples
         layer_start_points = [] # Stores (QPointF(x,y), z) tuples for layer starts
@@ -373,7 +378,13 @@ class GCodeParseThread(QThread):
         current_layer = -1 # Track the current layer
         layer_change_detected = False # Flag to mark if a new layer comment was just seen
 
-        # Regex to find G0/G1 commands and extract X, Y, Z values
+        # Track overall min/max for the entire toolpath
+        min_x_path, max_x_path = float('inf'), float('-inf')
+        min_y_path, max_y_path = float('inf'), float('-inf')
+        min_z_path, max_z_path = float('inf'), float('-inf')
+
+
+        # Regex to find G0/G1 commands and extract X, Y, Z, E values
         gcode_move_pattern = re.compile(r"^(G0|G1)\s*(?:X([-\d.]+))?\s*(?:Y([-\d.]+))?\s*(?:Z([-\d.]+))?\s*(?:E([-\d.]+))?.*$")
 
         self.log_signal.emit("Starting G-code toolpath parsing...", "debug")
@@ -397,7 +408,7 @@ class GCodeParseThread(QThread):
                 if new_layer > current_layer:
                     current_layer = new_layer
                     layer_change_detected = True
-                    self.log_signal.emit(f"Line {line_num + 1}: Detected new layer comment: {current_layer}", "debug")
+                    # self.log_signal.emit(f"Line {line_num + 1}: Detected new layer comment: {current_layer}", "debug") # Removed verbose debug
                 continue # Process next line, expecting a move command soon
 
             # Check for move commands (G0 or G1)
@@ -407,6 +418,7 @@ class GCodeParseThread(QThread):
                 
                 prev_x, prev_y, prev_z = current_x, current_y, current_z
 
+                # Determine new position based on absolute/relative mode
                 if x_str is not None:
                     x_val = float(x_str)
                     current_x = prev_x + x_val if is_relative else x_val
@@ -423,21 +435,48 @@ class GCodeParseThread(QThread):
                 if not toolpath_points or (QPointF(current_x, current_y), current_z) != toolpath_points[-1]:
                     toolpath_points.append((QPointF(current_x, current_y), current_z))
 
+                    # Update overall path bounds using the current position
+                    min_x_path = min(min_x_path, current_x)
+                    max_x_path = max(max_x_path, current_x)
+                    min_y_path = min(min_y_path, current_y)
+                    max_y_path = max(max_y_path, current_y)
+                    min_z_path = min(min_z_path, current_z)
+                    max_z_path = max(max_z_path, current_z)
+
+
                     # If a layer change was just detected AND this is a printing move (E present)
                     # or it's the first move after the layer comment, add it as a snapshot point.
                     # We also add a point if current Z is significantly higher than previous Z
                     # AND it's not a retract/unretract (i.e. E-value is not present or 0)
                     if layer_change_detected and (e_str is not None or current_z > prev_z + 0.05): # Use a small tolerance for Z change
                         layer_start_points.append((QPointF(current_x, current_y), current_z))
-                        self.log_signal.emit(f"Line {line_num + 1}: Added layer start point: ({current_x:.1f}, {current_y:.1f}, Z={current_z:.1f}) for layer {current_layer}", "debug")
+                        # self.log_signal.emit(f"Line {line_num + 1}: Added layer start point: ({current_x:.1f}, {current_y:.1f}, Z={current_z:.1f}) for layer {current_layer}", "debug") # Removed verbose debug
                         layer_change_detected = False # Reset flag after adding the point
 
         self.log_signal.emit(f"Finished G-code toolpath parsing. Parsed {len(toolpath_points)} toolpath points for preview, including Z coordinates.", "debug")
-        self.log_signal.emit(f"Detected {len(layer_start_points)} potential layer start points for snapshots.", "debug")
+        # self.log_signal.emit(f"Detected {len(layer_start_points)} potential layer start points for snapshots.", "debug") # Removed verbose debug
+
+        # Handle cases where no moves were found (min/max remain inf)
+        if min_x_path == float('inf'): # No moves, set reasonable defaults for an empty path
+            min_x_path, max_x_path = 0.0, 0.0
+            min_y_path, max_y_path = 0.0, 0.0
+            min_z_path, max_z_path = 0.0, 0.0
+        
+        # Consolidate toolpath bounds into a dictionary
+        toolpath_bounds = {
+            "min_x_path": min_x_path,
+            "max_x_path": max_x_path,
+            "min_y_path": min_y_path,
+            "max_y_path": max_y_path,
+            "min_z_path": min_z_path, 
+            "max_z_path": max_z_path
+        }
+        self.log_signal.emit(f"Calculated toolpath bounds: {toolpath_bounds}", "debug")
 
         if not toolpath_points:
             self.log_signal.emit("Warning: No X/Y movement commands found or parsed in the G-code for the preview.", "warning")
-        return toolpath_points, layer_start_points
+        
+        return toolpath_points, layer_start_points, toolpath_bounds # Return the new bounds
 
 
 class PrintPathApp(QMainWindow):
@@ -517,7 +556,6 @@ class PrintPathApp(QMainWindow):
         self.dwell_time_input.setValue(self.current_settings.get("dwell_time", self.global_default_settings.get("dwell_time", 500)))
         self.dwell_time_input.valueChanged.connect(lambda value: self._update_setting("dwell_time", value))
         self.dwell_time_input.setToolTip("The duration (in milliseconds) the printer waits at the snapshot position.")
-        # FIX: Corrected typo from 'self_settings_form_layout' to 'self.settings_form_layout'
         self.settings_form_layout.addRow(self.dwell_time_label, self.dwell_time_input) 
         self.global_setting_widgets["dwell_time"] = (self.dwell_time_label, self.dwell_time_input)
 
@@ -594,7 +632,7 @@ class PrintPathApp(QMainWindow):
         self.view_mode_combo = QComboBox()
         self.view_mode_combo.addItem("Top View (XY)")
         self.view_mode_combo.addItem("Front View (XZ)")
-        self.view_mode_combo.setCurrentText(self.current_settings.get("preview_view_mode", "Top View (XY)"))
+        self.view_mode_combo.setCurrentText(self.current_settings.get("preview_view_mode", "Top View (XY)))"))
         self.view_mode_combo.currentTextChanged.connect(self._update_view_mode)
         self.view_mode_combo.setToolTip("Select the perspective for the G-code preview.")
         
@@ -713,8 +751,8 @@ class PrintPathApp(QMainWindow):
             self._log_message("ERROR: self.menuBar() returned None. Menu bar cannot be created.", "error")
             return
         
-        self._log_message("Menu bar object created successfully.", "debug")
-        self._log_message("Menu bar setup initiated.", "debug")
+        # self._log_message("Menu bar object created successfully.", "debug") # Removed verbose debug
+        # self._log_message("Menu bar setup initiated.", "debug") # Removed verbose debug
 
         file_menu = menu_bar.addMenu("&File")
 
@@ -790,7 +828,7 @@ class PrintPathApp(QMainWindow):
         Populates the script combo box with .py files found in SCRIPTS_DIR.
         Also parses global and script-specific settings defined in each script.
         """
-        print(f"DEBUG: Entering load_scripts(). Scanning directory: {SCRIPTS_DIR}", file=sys.__stdout__)
+        # print(f"DEBUG: Entering load_scripts(). Scanning directory: {SCRIPTS_DIR}", file=sys.__stdout__) # Removed verbose debug
         if not os.path.exists(SCRIPTS_DIR):
             os.makedirs(SCRIPTS_DIR)
             self._log_message(f"Created scripts directory: {SCRIPTS_DIR}", "info")
@@ -806,13 +844,13 @@ class PrintPathApp(QMainWindow):
         found_scripts = False
         
         script_files = [f for f in os.listdir(SCRIPTS_DIR) if f.endswith(".py")]
-        print(f"DEBUG: Found script files: {script_files}", file=sys.__stdout__)
+        # print(f"DEBUG: Found script files: {script_files}", file=sys.__stdout__) # Removed verbose debug
 
         for filename in script_files:
             script_name = filename[:-3]
             self.script_combo.addItem(script_name)
             found_scripts = True
-            print(f"DEBUG: Adding script '{script_name}' to combo box.", file=sys.__stdout__)
+            # print(f"DEBUG: Adding script '{script_name}' to combo box.", file=sys.__stdout__) # Removed verbose debug
 
             script_path = os.path.join(SCRIPTS_DIR, filename)
             current_script_custom_defs = {}
@@ -825,7 +863,7 @@ class PrintPathApp(QMainWindow):
                             try:
                                 current_script_custom_defs = json.loads(json_str)
                                 self._log_message(f"Parsed SCRIPT_SETTINGS for '{script_name}': {current_script_custom_defs}", "debug")
-                                print(f"DEBUG: Parsed SCRIPT_SETTINGS for '{script_name}': {current_script_custom_defs}", file=sys.__stdout__)
+                                # print(f"DEBUG: Parsed SCRIPT_SETTINGS for '{script_name}': {current_script_custom_defs}", file=sys.__stdout__) # Removed verbose debug
                             except json.JSONDecodeError as e:
                                 self._log_message(f"Error parsing SCRIPT_SETTINGS JSON for '{script_name}' on line {line_num + 1}: {e}", "error")
                                 print(f"ERROR: Error parsing SCRIPT_SETTINGS JSON for '{script_name}' on line {line_num + 1}: {e}", file=sys.__stdout__)
@@ -834,7 +872,7 @@ class PrintPathApp(QMainWindow):
                 
                 self.script_global_settings_map[script_name] = all_global_setting_keys
                 self.script_custom_settings_defs_map[script_name] = current_script_custom_defs
-                print(f"DEBUG: Populated script_custom_settings_defs_map for '{script_name}': {self.script_custom_settings_defs_map.get(script_name)}", file=sys.__stdout__)
+                # print(f"DEBUG: Populated script_custom_settings_defs_map for '{script_name}': {self.script_custom_settings_defs_map.get(script_name)}", file=sys.__stdout__) # Removed verbose debug
 
                 if script_name not in self.current_settings:
                     self.current_settings[script_name] = {}
@@ -849,7 +887,7 @@ class PrintPathApp(QMainWindow):
                             default_value = defs.get("default", defs.get("items", [""])[0])
                         
                         self.current_settings[script_name][setting_key] = default_value
-                        print(f"DEBUG: Initialized default value for '{script_name}.{setting_key}': {default_value}", file=sys.__stdout__)
+                        # print(f"DEBUG: Initialized default value for '{script_name}.{setting_key}': {default_value}", file=sys.__stdout__) # Removed verbose debug
 
 
             except Exception as e:
@@ -863,7 +901,7 @@ class PrintPathApp(QMainWindow):
             self._log_message(f"No scripts found in '{SCRIPTS_DIR}'. Please add .py files.", "warning")
             print(f"WARNING: No scripts found in '{SCRIPTS_DIR}'.", file=sys.__stdout__)
         
-        print(f"DEBUG: Exiting load_scripts(). Final script_custom_settings_defs_map: {self.script_custom_settings_defs_map}", file=sys.__stdout__)
+        # print(f"DEBUG: Exiting load_scripts(). Final script_custom_settings_defs_map: {self.script_custom_settings_defs_map}", file=sys.__stdout__) # Removed verbose debug
 
 
     def _update_settings_panel_visibility(self):
@@ -874,10 +912,10 @@ class PrintPathApp(QMainWindow):
         Crucially, it clamps the current value of QSpinBox widgets to their new valid range.
         """
         selected_script_name = self.script_combo.currentText()
-        print(f"DEBUG: Entering _update_settings_panel_visibility() for script: '{selected_script_name}'", file=sys.__stdout__)
+        # print(f"DEBUG: Entering _update_settings_panel_visibility() for script: '{selected_script_name}'", file=sys.__stdout__) # Removed verbose debug
 
         if not selected_script_name:
-            print("DEBUG: No script selected. Hiding all settings.", file=sys.__stdout__)
+            # print("DEBUG: No script selected. Hiding all settings.", file=sys.__stdout__) # Removed verbose debug
             for setting_key, (label_widget, input_widget) in self.global_setting_widgets.items():
                 label_widget.setVisible(False)
                 input_widget.setVisible(False)
@@ -885,7 +923,7 @@ class PrintPathApp(QMainWindow):
             return
 
         expected_global_settings = self.script_global_settings_map.get(selected_script_name, [])
-        print(f"DEBUG: Expected global settings for '{selected_script_name}': {expected_global_settings}", file=sys.__stdout__)
+        # print(f"DEBUG: Expected global settings for '{selected_script_name}': {expected_global_settings}", file=sys.__stdout__) # Removed verbose debug
 
 
         for setting_key, (label_widget, input_widget) in self.global_setting_widgets.items():
@@ -893,15 +931,15 @@ class PrintPathApp(QMainWindow):
             label_widget.setVisible(is_visible)
             input_widget.setVisible(is_visible)
             input_widget.setEnabled(not self.progress_bar.isVisible())
-            print(f"DEBUG: Global setting '{setting_key}': visible={is_visible}, enabled={input_widget.isEnabled()}", file=sys.__stdout__)
+            # print(f"DEBUG: Global setting '{setting_key}': visible={is_visible}, enabled={input_widget.isEnabled()}", file=sys.__stdout__) # Removed verbose debug
 
 
         self._clear_dynamic_setting_widgets()
-        print("DEBUG: Cleared previous dynamic settings.", file=sys.__stdout__)
+        # print("DEBUG: Cleared previous dynamic settings.", file=sys.__stdout__) # Removed verbose debug
 
         self.script_specific_setting_widgets = {} 
         custom_setting_defs = self.script_custom_settings_defs_map.get(selected_script_name, {})
-        print(f"DEBUG: Custom setting definitions for '{selected_script_name}': {custom_setting_defs}", file=sys.__stdout__)
+        # print(f"DEBUG: Custom setting definitions for '{selected_script_name}': {custom_setting_defs}", file=sys.__stdout__) # Removed verbose debug
         
         if selected_script_name not in self.current_settings:
             self.current_settings[selected_script_name] = {}
@@ -916,7 +954,7 @@ class PrintPathApp(QMainWindow):
             value_from_settings = script_current_settings.get(setting_key)
             default_from_defs = defs.get("default")
             
-            print(f"DEBUG: Processing dynamic setting '{setting_key}' (type: {setting_type})", file=sys.__stdout__)
+            # print(f"DEBUG: Processing dynamic setting '{setting_key}' (type: {setting_type})", file=sys.__stdout__) # Removed verbose debug
 
 
             if setting_type == "spinbox":
@@ -928,7 +966,7 @@ class PrintPathApp(QMainWindow):
                     max_val_actual = max(1, self.gcode_info_full_data["total_layers"])
                     max_val = min(max_val_actual, max(1, max_val_def)) 
                     self._log_message(f"Setting max for '{setting_key}' to {max_val} (derived from total layers {self.gcode_info_full_data['total_layers']}).", "debug")
-                    print(f"DEBUG: Setting max for '{setting_key}' to {max_val} (derived from total layers {self.gcode_info_full_data['total_layers']}).", file=sys.__stdout__)
+                    # print(f"DEBUG: Setting max for '{setting_key}' to {max_val} (derived from total layers {self.gcode_info_full_data['total_layers']}).", file=sys.__stdout__) # Removed verbose debug
                 else:
                     max_val = max_val_def 
                 
@@ -939,7 +977,7 @@ class PrintPathApp(QMainWindow):
                 input_widget.setValue(clamped_value)
 
                 input_widget.valueChanged.connect(lambda value, key=setting_key: self._update_script_specific_setting(selected_script_name, key, value))
-                print(f"DEBUG: Spinbox '{setting_key}' set to value: {clamped_value} (Range: {min_val}-{max_val})", file=sys.__stdout__)
+                # print(f"DEBUG: Spinbox '{setting_key}' set to value: {clamped_value} (Range: {min_val}-{max_val})", file=sys.__stdout__) # Removed verbose debug
 
             elif setting_type == "doublespinbox":
                 input_widget = QDoubleSpinBox()
@@ -949,7 +987,7 @@ class PrintPathApp(QMainWindow):
                 input_widget.setDecimals(defs.get("decimals", 2))
                 input_widget.setValue(value_from_settings if value_from_settings is not None else (default_from_defs if default_from_defs is not None else min_val))
                 input_widget.valueChanged.connect(lambda value, key=setting_key: self._update_script_specific_setting(selected_script_name, key, value))
-                print(f"DEBUG: DoubleSpinbox '{setting_key}' set to value: {input_widget.value()} (Range: {min_val}-{max_val})", file=sys.__stdout__)
+                # print(f"DEBUG: DoubleSpinbox '{setting_key}' set to value: {input_widget.value()} (Range: {min_val}-{max_val})", file=sys.__stdout__) # Removed verbose debug
 
             elif setting_type == "combobox":
                 input_widget = QComboBox()
@@ -957,19 +995,19 @@ class PrintPathApp(QMainWindow):
                 input_widget.addItems(items)
                 input_widget.setCurrentText(value_from_settings if value_from_settings is not None else (default_from_defs if default_from_defs is not None else (items[0] if items else "")))
                 input_widget.currentTextChanged.connect(lambda text, key=setting_key: self._update_script_specific_setting(selected_script_name, key, text))
-                print(f"DEBUG: Combobox '{setting_key}' set to text: '{input_widget.currentText()}' (Items: {items})", file=sys.__stdout__)
+                # print(f"DEBUG: Combobox '{setting_key}' set to text: '{input_widget.currentText()}' (Items: {items})", file=sys.__stdout__) # Removed verbose debug
 
             if input_widget:
                 input_widget.setToolTip(defs.get("tooltip", label_text.replace(":", "") + ".")) 
                 self.settings_form_layout.addRow(label_widget, input_widget)
                 self.script_specific_setting_widgets[setting_key] = (label_widget, input_widget)
                 input_widget.setEnabled(not self.progress_bar.isVisible())
-                print(f"DEBUG: Added dynamic widget for '{setting_key}'. Enabled: {input_widget.isEnabled()}", file=sys.__stdout__)
+                # print(f"DEBUG: Added dynamic widget for '{setting_key}'. Enabled: {input_widget.isEnabled()}", file=sys.__stdout__) # Removed verbose debug
 
 
         self._log_message(f"Updated settings panel for script: '{selected_script_name}'.", "debug")
-        self._log_message(f"Current Settings Object: {self.current_settings}", "debug")
-        print(f"DEBUG: Exiting _update_settings_panel_visibility(). Current Settings: {self.current_settings}", file=sys.__stdout__)
+        # self._log_message(f"Current Settings Object: {self.current_settings}", "debug") # Removed verbose debug
+        # print(f"DEBUG: Exiting _update_settings_panel_visibility(). Current Settings: {self.current_settings}", file=sys.__stdout__) # Removed verbose debug
 
         self.current_settings["last_used_script"] = selected_script_name
         save_settings(self.current_settings)
@@ -981,24 +1019,13 @@ class PrintPathApp(QMainWindow):
         This method is designed to avoid the "wrapped C/C++ object of type QLabel has been deleted"
         warning by properly removing items from the layout.
         """
-        print(f"DEBUG: Clearing dynamic setting widgets for current script.", file=sys.__stdout__)
+        # print(f"DEBUG: Clearing dynamic setting widgets for current script.", file=sys.__stdout__) # Removed verbose debug
 
-        # Iterate in reverse to safely remove items from the layout
-        # QFormLayout has a specific way to remove rows by index or by widget.
-        # We need to remove the rows and then explicitly delete the widgets.
         while self.settings_form_layout.count() > len(self.global_setting_widgets):
-            # The dynamic widgets are added after the global ones.
-            # Get the last row's item and remove it.
-            # QFormLayout.takeAt(index) removes and returns the layout item at index.
-            # QFormLayout.removeRow(index) removes the row but doesn't return the item.
-            # We want to remove the specific widgets we added dynamically.
-            
             found_and_removed = False
             for setting_key, (label_widget, input_widget) in list(self.script_specific_setting_widgets.items()):
-                # Find the index of the row containing these widgets
                 row_index = -1
                 for i in range(self.settings_form_layout.rowCount()):
-                    # Check if the label or field item in the row matches our widgets
                     if self.settings_form_layout.itemAt(i, QFormLayout.LabelRole) and self.settings_form_layout.itemAt(i, QFormLayout.LabelRole).widget() is label_widget:
                         row_index = i
                         break
@@ -1007,29 +1034,18 @@ class PrintPathApp(QMainWindow):
                         break
                 
                 if row_index != -1:
-                    # Removing the row also removes and implicitly deletes the widgets in that row.
-                    # This avoids the "wrapped C/C++ object deleted" warning.
                     self.settings_form_layout.removeRow(row_index)
-                    # No need to explicitly deleteLater() as removeRow handles it.
                     del self.script_specific_setting_widgets[setting_key]
                     found_and_removed = True
-                    print(f"DEBUG: Removed dynamic widget row for '{setting_key}'.", file=sys.__stdout__)
-                    break # Break and re-iterate the list(self.script_specific_setting_widgets.items())
-                          # because the dictionary size changes during iteration.
+                    # print(f"DEBUG: Removed dynamic widget row for '{setting_key}'.", file=sys.__stdout__) # Removed verbose debug
+                    break 
             
             if not found_and_removed:
-                # If we couldn't find a dynamic widget to remove, something is wrong,
-                # or all dynamic widgets are already gone. Break to prevent infinite loop.
-                print("DEBUG: No more dynamic widgets found to clear or an issue occurred during removal.", file=sys.__stdout__)
+                # print("DEBUG: No more dynamic widgets found to clear or an issue occurred during removal.", file=sys.__stdout__) # Removed verbose debug
                 break
 
-        # After removing from layout, clear the Python dictionary of references
         self.script_specific_setting_widgets.clear()
-        print("DEBUG: script_specific_setting_widgets cleared.", file=sys.__stdout__)
-        # Ensure all widgets that were removed from the layout are indeed deleted later
-        # Qt's memory management usually handles this automatically once the widgets are parentless
-        # but to be absolutely sure, if they were *not* implicitly deleted by removeRow,
-        # they would be memory leaked. The above change for removeRow should prevent the warning.
+        # print("DEBUG: script_specific_setting_widgets cleared.", file=sys.__stdout__) # Removed verbose debug
 
 
     def _go_button_clicked(self):
@@ -1037,12 +1053,10 @@ class PrintPathApp(QMainWindow):
         Handles the Go! button click. If in "Open Processed File" mode, opens the file.
         Otherwise, initiates G-code processing.
         """
-        print(f"DEBUG: Go! button clicked. Current text: '{self.go_button.text()}'", file=sys.__stdout__)
+        # print(f"DEBUG: Go! button clicked. Current text: '{self.go_button.text()}'", file=sys.__stdout__) # Removed verbose debug
         if self.go_button.text().startswith("Open "): 
             self._open_processed_file_with_default_app()
         else:
-            # If the button says "Go!", it means we need to process the current G-code
-            # with the current settings.
             self._process_current_gcode()
 
 
@@ -1053,18 +1067,18 @@ class PrintPathApp(QMainWindow):
         """
         if not self.original_gcode_filepath:
             self._log_message("No G-code file loaded to process. Please open a file first.", "warning")
-            print("WARNING: No G-code file loaded to process.", file=sys.__stdout__)
+            # print("WARNING: No G-code file loaded to process.", file=sys.__stdout__) # Removed verbose debug
             return
 
         mode = self.script_combo.currentText() if self.script_combo.currentText() else DEFAULT_MODE
         
         self._set_ui_processing_state(True)
         self._log_message(f"Processing '{os.path.basename(self.original_gcode_filepath)}' with '{mode}' script...", "info")
-        print(f"DEBUG: Initiating G-code processing for '{os.path.basename(self.original_gcode_filepath)}' with '{mode}'.", file=sys.__stdout__)
+        # print(f"DEBUG: Initiating G-code processing for '{os.path.basename(self.original_gcode_filepath)}' with '{mode}'.", file=sys.__stdout__) # Removed verbose debug
 
 
         save_settings(self.current_settings)
-        self._log_message("Current settings saved automatically.", "debug")
+        # self._log_message("Current settings saved automatically.", "debug") # Removed verbose debug
 
         combined_settings = {}
         for key in self.global_default_settings.keys():
@@ -1076,10 +1090,14 @@ class PrintPathApp(QMainWindow):
         combined_settings["debug_mode"] = self.current_settings.get("debug_mode", False)
         # Pass full gcode_info_full_data to scripts for comprehensive access
         combined_settings.update(self.gcode_info_full_data)
+        # Explicitly ensure min_z is passed if it was detected from toolpath
+        if "min_z_path" in self.gcode_info_full_data:
+            combined_settings["min_z_print"] = self.gcode_info_full_data["min_z_path"] # Pass min_z from parsing
+            self._log_message(f"Passing min_z_print: {combined_settings['min_z_print']:.1f} to script.", "debug")
 
 
-        self._log_message(f"Combined settings passed to GCodeProcessorThread for '{mode}': {combined_settings}", "debug")
-        print(f"DEBUG: Combined settings sent to thread: {combined_settings}", file=sys.__stdout__)
+        # self._log_message(f"Combined settings passed to GCodeProcessorThread for '{mode}': {combined_settings}", "debug") # Removed verbose debug
+        # print(f"DEBUG: Combined settings sent to thread: {combined_settings}", file=sys.__stdout__) # Removed verbose debug
 
 
         self.processor_thread = GCodeProcessorThread(self.original_gcode_filepath, mode, combined_settings)
@@ -1095,28 +1113,23 @@ class PrintPathApp(QMainWindow):
         If a file is selected, it sets the file path, detects G-code flavor,
         and starts a separate thread for parsing.
         """
-        print("DEBUG: Open G-code file dialog initiated.", file=sys.__stdout__)
+        # print("DEBUG: Open G-code file dialog initiated.", file=sys.__stdout__) # Removed verbose debug
         filepath, _ = QFileDialog.getOpenFileName(
             self, "Open G-code File", self.last_used_directory, "G-code Files (*.gcode);;All Files (*)"
         )
         if filepath:
-            print(f"DEBUG: File selected: {filepath}", file=sys.__stdout__)
-            # Check if this file is already loaded
+            # print(f"DEBUG: File selected: {filepath}", file=sys.__stdout__) # Removed verbose debug
+            
+            # --- FIX: Ensure Go! button resets even if same file is re-opened ---
+            # If the same file is chosen, we still want to reset the UI state.
             if self.original_gcode_filepath == filepath:
-                self._log_message(f"File '{os.path.basename(filepath)}' is already loaded. No re-parsing needed.", "info")
-                print(f"INFO: File '{os.path.basename(filepath)}' already loaded. Refreshing viewer state.", file=sys.__stdout__)
-                # Just ensure the preview is up-to-date in case it was cleared or something
-                if self.gcode_bed_dimensions:
-                    self.gcode_viewer.set_bed_dimensions(self.gcode_bed_dimensions['x'], self.gcode_bed_dimensions['y'])
-                # Re-apply current view mode in case it changed
-                self._update_view_mode(self.view_mode_combo.currentText()) 
-                # Re-set data to trigger repaint with current view mode
-                self.gcode_viewer.set_gcode_data(self.gcode_toolpath_data)
-                self.gcode_viewer.set_layer_start_points(self.gcode_layer_start_points) # Pass layer start points
-                self.gcode_viewer.set_processed_snapshot_points([]) # Clear processed snapshots if same file re-opened without re-processing
-                self.go_button.setEnabled(True)
-                return
-
+                self._log_message(f"File '{os.path.basename(filepath)}' is already loaded. Resetting 'Go!' button.", "info")
+                self.go_button.setText("Go!") # Reset button text
+                self.go_button.setEnabled(True) # Ensure it's enabled
+                self.gcode_viewer.set_processed_snapshot_points([]) # Clear processed snapshots on re-open
+                self._update_view_mode(self.view_mode_combo.currentText()) # Redraw viewer if needed
+                self._on_settings_or_file_changed() # Signal that settings/file state has changed, enabling Go button
+                return # Exit, no re-parsing needed for same path
 
             self.original_gcode_filepath = filepath
             
@@ -1128,7 +1141,7 @@ class PrintPathApp(QMainWindow):
             if len(filename_only) > MAX_TITLE_FILENAME_LENGTH:
                 filename_only = "..." + filename_only[-(MAX_TITLE_FILENAME_LENGTH - 3):]
             self.setWindowTitle(f"PrintPath - {filename_only}")
-            print(f"DEBUG: Window title set to: PrintPath - {filename_only}", file=sys.__stdout__)
+            # print(f"DEBUG: Window title set to: PrintPath - {filename_only}", file=sys.__stdout__) # Removed verbose debug
 
             # Clear processed snapshot points when a new file is opened
             self.gcode_viewer.set_processed_snapshot_points([])
@@ -1143,54 +1156,95 @@ class PrintPathApp(QMainWindow):
             self.parse_thread.start()
 
             self._log_message(f"Loading '{filename_only}' for preview...", "info")
-            print(f"INFO: Starting parsing thread for '{filename_only}'.", file=sys.__stdout__)
+            # print(f"INFO: Starting parsing thread for '{filename_only}'.", file=sys.__stdout__) # Removed verbose debug
 
 
-    def _parsing_finished(self, gcode_info, toolpath_data, layer_start_points):
+    def _parsing_finished(self, gcode_info, toolpath_data, layer_start_points, toolpath_bounds): # MODIFIED: Added toolpath_bounds
         """
         Slot connected to GCodeParseThread's finished signal.
         Updates UI with parsed G-code info and toolpath, and layer start points.
         """
         self._set_ui_for_parsing_state(False) # Hide progress bar, enable UI
-        print("DEBUG: G-code parsing finished. Updating UI.", file=sys.__stdout__)
+        # print("DEBUG: G-code parsing finished. Updating UI.", file=sys.__stdout__) # Removed verbose debug
 
         self.gcode_info_full_data = gcode_info # Store full info
         
-        # --- Update bed dimensions and max_z ---
-        self.gcode_bed_dimensions = gcode_info.get("bed_dimensions")
-        detected_max_z = gcode_info.get("max_z", 250.0) # Default to 250 if not detected
+        # --- Robust Model Bounding Box Detection Logic ---
+        # Calculate width/height from comment-parsed bbox
+        comment_bbox_width = (self.gcode_info_full_data.get("max_x", 0) - self.gcode_info_full_data.get("min_x", 0))
+        comment_bbox_height = (self.gcode_info_full_data.get("max_y", 0) - self.gcode_info_full_data.get("min_y", 0))
+
+        # Check if comment-parsed bbox is "suspiciously small" or non-existent
+        use_toolpath_for_bbox = False
+        if (self.gcode_info_full_data.get("min_x") is None or comment_bbox_width < MIN_MODEL_DIMENSION_THRESHOLD) or \
+           (self.gcode_info_full_data.get("min_y") is None or comment_bbox_height < MIN_MODEL_DIMENSION_THRESHOLD):
+            use_toolpath_for_bbox = True
+            self._log_message(f"Comment-based bbox is too small ({comment_bbox_width:.1f}x{comment_bbox_height:.1f}mm) or missing. Prioritizing toolpath bounds.", "warning")
+            # print(f"WARNING: Comment-based bbox is too small ({comment_bbox_width:.1f}x{comment_bbox_height:.1f}mm) or missing. Prioritizing toolpath bounds.", file=sys.__stdout__) # Removed verbose debug
+        else:
+            self._log_message(f"Using comment-based bbox for model center: X[{self.gcode_info_full_data['min_x']:.1f}:{self.gcode_info_full_data['max_x']:.1f}] Y[{self.gcode_info_full_data['min_y']:.1f}:{self.gcode_info_full_data['max_y']:.1f}]", "debug")
+            # print(f"DEBUG: Using comment-based bbox for model center: X[{self.gcode_info_full_data['min_x']:.1f}:{self.gcode_info_full_data['max_x']:.1f}] Y[{self.gcode_info_full_data['min_y']:.1f}:{self.gcode_info_full_data['max_y']:.1f}]", file=sys.__stdout__) # Removed verbose debug
+
+
+        if use_toolpath_for_bbox:
+            # Override with toolpath bounds
+            self.gcode_info_full_data["min_x"] = toolpath_bounds["min_x_path"]
+            self.gcode_info_full_data["max_x"] = toolpath_bounds["max_x_path"]
+            self.gcode_info_full_data["min_y"] = toolpath_bounds["min_y_path"]
+            self.gcode_info_full_data["max_y"] = toolpath_bounds["max_y_path"]
+            self._log_message(f"Overridden model X bounds with toolpath: {self.gcode_info_full_data['min_x']:.1f}:{self.gcode_info_full_data['max_x']:.1f}", "debug")
+            self._log_message(f"Overridden model Y bounds with toolpath: {self.gcode_info_full_data['min_y']:.1f}:{self.gcode_info_full_data['max_y']:.1f}", "debug")
+            # print(f"DEBUG: Overridden model X bounds with toolpath: {self.gcode_info_full_data['min_x']:.1f}:{self.gcode_info_full_data['max_x']:.1f}", file=sys.__stdout__) # Removed verbose debug
+            # print(f"DEBUG: Overridden model Y bounds with toolpath: {self.gcode_info_full_data['min_y']:.1f}:{self.gcode_info_full_data['max_y']:.1f}", file=sys.__stdout__) # Removed verbose debug
+
+
+        # Always update max_z if toolpath indicates a higher Z
+        if self.gcode_info_full_data.get("max_z") is None or self.gcode_info_full_data["max_z"] < toolpath_bounds["max_z_path"]:
+            self.gcode_info_full_data["max_z"] = toolpath_bounds["max_z_path"]
+            self._log_message(f"Using toolpath max Z for model: {self.gcode_info_full_data['max_z']:.1f}", "debug")
+            # print(f"DEBUG: Using toolpath max Z for model: {self.gcode_info_full_data['max_z']:.1f}", file=sys.__stdout__) # Removed verbose debug
+
+        # --- IMPORTANT: Also store min_z from toolpath in gcode_info_full_data ---
+        # This ensures the script receives the true lowest point of the model.
+        self.gcode_info_full_data["min_z_path"] = toolpath_bounds["min_z_path"]
+        self._log_message(f"Detected toolpath min Z for model: {self.gcode_info_full_data['min_z_path']:.1f}", "debug")
+
+
+        # --- Update bed dimensions and max_z for viewer ---
+        self.gcode_bed_dimensions = self.gcode_info_full_data.get("bed_dimensions")
+        detected_max_z = self.gcode_info_full_data.get("max_z", 250.0) # Default to 250 if not detected
         
         if self.gcode_bed_dimensions:
             self._log_message(f"Detected bed dimensions: {self.gcode_bed_dimensions['x']:.1f}x{self.gcode_bed_dimensions['y']:.1f}mm, Max Z: {detected_max_z:.1f}mm", "debug")
-            print(f"DEBUG: Detected bed dimensions: {self.gcode_bed_dimensions['x']:.1f}x{self.gcode_bed_dimensions['y']:.1f}mm, Max Z: {detected_max_z:.1f}mm", file=sys.__stdout__)
+            # print(f"DEBUG: Detected bed dimensions: {self.gcode_bed_dimensions['x']:.1f}x{self.gcode_bed_dimensions['y']:.1f}mm, Max Z: {detected_max_z:.1f}mm", file=sys.__stdout__) # Removed verbose debug
             # Ensure bed dimensions are valid numbers before passing to viewer
             bed_x = max(1.0, self.gcode_bed_dimensions.get('x', 220.0))
             bed_y = max(1.0, self.gcode_bed_dimensions.get('y', 220.0))
             self.gcode_viewer.set_bed_dimensions(bed_x, bed_y, detected_max_z)
         else:
             self._log_message("Bed dimensions not detected from file. Viewer will use default 220x220mm.", "warning")
-            print("WARNING: Bed dimensions not detected from file. Using default 220x220mm.", file=sys.__stdout__)
+            # print("WARNING: Bed dimensions not detected from file. Using default 220x220mm.", file=sys.__stdout__) # Removed verbose debug
             self.gcode_bed_dimensions = {"x": DEFAULT_BED_X, "y": DEFAULT_BED_Y} # Set fallback in main app as well
             self.gcode_viewer.set_bed_dimensions(DEFAULT_BED_X, DEFAULT_BED_Y, detected_max_z)
 
         # --- Update firmware flavor ---
-        detected_flavor = gcode_info.get("gcode_flavor")
+        detected_flavor = self.gcode_info_full_data.get("gcode_flavor")
         if detected_flavor:
             self._log_message(f"Detected G-code flavor: {detected_flavor}", "debug")
-            print(f"DEBUG: Detected G-code flavor: {detected_flavor}", file=sys.__stdout__)
+            # print(f"DEBUG: Detected G-code flavor: {detected_flavor}", file=sys.__stdout__) # Removed verbose debug
             self.firmware_input.blockSignals(True)
             self.firmware_input.setCurrentText(detected_flavor)
             self.firmware_input.blockSignals(False)
             self._update_setting("firmware", detected_flavor) 
         else:
             self._log_message("G-code flavor not detected from file. Using current firmware setting.", "debug")
-            print("DEBUG: G-code flavor not detected from file. Using current firmware setting.", file=sys.__stdout__)
+            # print("DEBUG: G-code flavor not detected from file. Using current firmware setting.", file=sys.__stdout__) # Removed verbose debug
 
         # --- Update toolpath data ---
         self.gcode_toolpath_data = toolpath_data # Now list of (QPointF(x,y), z_value)
-        print(f"DEBUG (main.py): About to pass {len(self.gcode_toolpath_data)} points to GCodeViewer.set_gcode_data().", file=sys.__stdout__)
-        if self.gcode_toolpath_data and len(self.gcode_toolpath_data) > 0:
-            print(f"DEBUG (main.py): First point to viewer: ({self.gcode_toolpath_data[0][0].x():.1f}, {self.gcode_toolpath_data[0][0].y():.1f}, Z={self.gcode_toolpath_data[0][1]:.1f})", file=sys.__stdout__)
+        # print(f"DEBUG (main.py): About to pass {len(self.gcode_toolpath_data)} points to GCodeViewer.set_gcode_data().", file=sys.__stdout__) # Removed verbose debug
+        # if self.gcode_toolpath_data and len(self.gcode_toolpath_data) > 0: # Removed verbose debug
+            # print(f"DEBUG (main.py): First point to viewer: ({self.gcode_toolpath_data[0][0].x():.1f}, {self.gcode_toolpath_data[0][0].y():.1f}, Z={self.gcode_toolpath_data[0][1]:.1f})", file=sys.__stdout__) # Removed verbose debug
         self._log_message(f"Passing {len(self.gcode_toolpath_data)} points to GCodeViewer.set_gcode_data().", "debug")
         self.gcode_viewer.set_gcode_data(self.gcode_toolpath_data) # Pass the new (XY, Z) tuples
         
@@ -1212,7 +1266,7 @@ class PrintPathApp(QMainWindow):
         
         self.go_button.setEnabled(True) 
         self._log_message(f"File '{os.path.basename(self.original_gcode_filepath)}' loaded for preview. Click 'Go!' to process.", "info")
-        print(f"INFO: File '{os.path.basename(self.original_gcode_filepath)}' loaded successfully for preview.", file=sys.__stdout__)
+        # print(f"INFO: File '{os.path.basename(self.original_gcode_filepath)}' loaded successfully for preview.", file=sys.__stdout__) # Removed verbose debug
 
 
     def _parsing_error(self, message):
@@ -1239,14 +1293,13 @@ class PrintPathApp(QMainWindow):
         """
         Manages UI state specifically during G-code file parsing for preview.
         """
-        print(f"DEBUG: Setting UI for parsing state: is_parsing={is_parsing}", file=sys.__stdout__)
+        # print(f"DEBUG: Setting UI for parsing state: is_parsing={is_parsing}", file=sys.__stdout__) # Removed verbose debug
         self.script_combo.setEnabled(not is_parsing)
         self.settings_group_box.setEnabled(not is_parsing)
         self.go_button.setEnabled(not is_parsing)
         self.clear_log_button.setEnabled(not is_parsing) 
-        self.view_mode_combo.setEnabled(not is_parsing) # Disable view mode during parsing
+        self.view_mode_combo.setEnabled(not is_parsing) 
         
-        # Disable menu bar actions while parsing
         for action in self.menuBar().actions():
             if hasattr(action, 'menu') and action.menu(): 
                 action.menu().setEnabled(not is_parsing)
@@ -1258,7 +1311,6 @@ class PrintPathApp(QMainWindow):
             self.progress_bar.show()
         else:
             self.progress_bar.hide()
-            # Ensure debug mode action is re-enabled
             if self.debug_mode_action:
                 self.debug_mode_action.setEnabled(True)
 
@@ -1270,7 +1322,7 @@ class PrintPathApp(QMainWindow):
         Also updates snapshot points in the viewer.
         """
         self._set_ui_processing_state(False)
-        print(f"DEBUG: G-code processing finished for '{os.path.basename(original_filepath)}'.", file=sys.__stdout__)
+        # print(f"DEBUG: G-code processing finished for '{os.path.basename(original_filepath)}'.", file=sys.__stdout__) # Removed verbose debug
 
         if processed_content:
             self.processed_gcode_content = processed_content
@@ -1280,25 +1332,22 @@ class PrintPathApp(QMainWindow):
             
             snapshot_count = processed_content.count("TIMELAPSE_TAKE_FRAME")
             self._log_message(f"Detected {snapshot_count} TIMELAPSE_TAKE_FRAME commands in the processed G-code.", "info")
-            print(f"INFO: Detected {snapshot_count} TIMELAPSE_TAKE_FRAME commands.", file=sys.__stdout__)
+            # print(f"INFO: Detected {snapshot_count} TIMELAPSE_TAKE_FRAME commands.", file=sys.__stdout__) # Removed verbose debug
 
-            # Auto-save the processed content
             self.output_filepath = self._auto_save_processed_gcode(original_filepath, mode)
             
-            # Use the snapshot_points directly from the thread's result
-            # and pass them to the viewer
             self.gcode_viewer.set_processed_snapshot_points(snapshot_points)
             self._log_message(f"Viewer updated with {len(snapshot_points)} processed snapshot points.", "debug")
-            print(f"DEBUG: Viewer updated with {len(snapshot_points)} processed snapshot points.", file=sys.__stdout__)
+            # print(f"DEBUG: Viewer updated with {len(snapshot_points)} processed snapshot points.", file=sys.__stdout__) # Removed verbose debug
 
 
             if self.output_filepath:
                 self.go_button.setText(f"Open '{os.path.basename(self.output_filepath)}'")
                 self.go_button.setEnabled(True)
-                print(f"DEBUG: Auto-save successful. Go button text updated to 'Open {os.path.basename(self.output_filepath)}'.", file=sys.__stdout__)
+                # print(f"DEBUG: Auto-save successful. Go button text updated to 'Open {os.path.basename(self.output_filepath)}'.", file=sys.__stdout__) # Removed verbose debug
             else:
                 self._log_message("Automatic save failed, 'Open Processed File' button will not be available.", "warning")
-                print("WARNING: Automatic save failed. Open button disabled.", file=sys.__stdout__)
+                # print("WARNING: Automatic save failed. Open button disabled.", file=sys.__stdout__) # Removed verbose debug
                 self.go_button.setText("Go!") 
                 self.go_button.setEnabled(True) 
         else:
@@ -1307,7 +1356,7 @@ class PrintPathApp(QMainWindow):
             self.save_as_action.setEnabled(False)
             self.gcode_viewer.set_processed_snapshot_points([]) # Clear on no content
             self._log_message(f"Processing of '{os.path.basename(original_filepath)}' completed with no content.", "warning")
-            print(f"WARNING: Processing of '{os.path.basename(original_filepath)}' completed with no content.", file=sys.__stdout__)
+            # print(f"WARNING: Processing of '{os.path.basename(original_filepath)}' completed with no content.", file=sys.__stdout__) # Removed verbose debug
             self.setWindowTitle("PrintPath")
             self.go_button.setText("Go!") 
             self.go_button.setEnabled(True) 
@@ -1335,17 +1384,12 @@ class PrintPathApp(QMainWindow):
         Enables/disables relevant UI elements and shows/hides the progress bar
         based on whether processing is ongoing (for script processing).
         """
-        print(f"DEBUG: Setting UI for processing state: is_processing={is_processing}", file=sys.__stdout__)
-        # This function should only affect script processing state, not file loading/parsing.
-        # It's called after _parsing_finished, so parsing UI elements are already managed.
-
+        # print(f"DEBUG: Setting UI for processing state: is_processing={is_processing}", file=sys.__stdout__) # Removed verbose debug
         self.script_combo.setEnabled(not is_processing)
         self.settings_group_box.setEnabled(not is_processing)
         self.clear_log_button.setEnabled(not is_processing)
-        self.view_mode_combo.setEnabled(not is_processing) # Enable/disable view mode during processing
+        self.view_mode_combo.setEnabled(not is_processing) 
 
-
-        # Re-enable/disable based on overall processing state
         for action in self.menuBar().actions():
             if hasattr(action, 'menu') and action.menu(): 
                 action.menu().setEnabled(not is_processing)
@@ -1361,32 +1405,27 @@ class PrintPathApp(QMainWindow):
             self.save_as_action.setEnabled(False)
 
 
-        # Specific widgets related to settings
         for setting_key, (label_widget, input_widget) in self.global_setting_widgets.items():
             is_visible_by_script = label_widget.isVisible() 
             input_widget.setEnabled(not is_processing and is_visible_by_script)
-            print(f"DEBUG: Global setting widget '{setting_key}' enabled: {input_widget.isEnabled()} (visible by script: {is_visible_by_script})", file=sys.__stdout__)
+            # print(f"DEBUG: Global setting widget '{setting_key}' enabled: {input_widget.isEnabled()} (visible by script: {is_visible_by_script})", file=sys.__stdout__) # Removed verbose debug
 
 
         for setting_key, (label_widget, input_widget) in self.script_specific_setting_widgets.items():
             input_widget.setEnabled(not is_processing)
-            print(f"DEBUG: Script specific setting widget '{setting_key}' enabled: {input_widget.isEnabled()}", file=sys.__stdout__)
+            # print(f"DEBUG: Script specific setting widget '{setting_key}' enabled: {input_widget.isEnabled()}", file=sys.__stdout__) # Removed verbose debug
 
 
-        # Go button state logic is complex:
-        # It's enabled if a file is loaded AND no processing is ongoing.
-        # Its text changes after processing finishes successfully.
         if is_processing:
             self.go_button.setEnabled(False)
             self.progress_bar.show()
-            print("DEBUG: Processing active. Go button disabled, progress bar shown.", file=sys.__stdout__)
+            # print("DEBUG: Processing active. Go button disabled, progress bar shown.", file=sys.__stdout__) # Removed verbose debug
         else:
             self.progress_bar.hide()
-            # If a file is loaded, enable the go button
             self.go_button.setEnabled(self.original_gcode_filepath is not None)
             if self.debug_mode_action:
                 self.debug_mode_action.setEnabled(True)
-            print(f"DEBUG: Processing inactive. Go button enabled: {self.go_button.isEnabled()} (File loaded: {self.original_gcode_filepath is not None}). Progress bar hidden.", file=sys.__stdout__)
+            # print(f"DEBUG: Processing inactive. Go button enabled: {self.go_button.isEnabled()} (File loaded: {self.original_gcode_filepath is not None}). Progress bar hidden.", file=sys.__stdout__) # Removed verbose debug
 
     
     def _on_settings_or_file_changed(self):
@@ -1395,24 +1434,21 @@ class PrintPathApp(QMainWindow):
         and *not* for triggering G-code re-parsing.
         It primarily updates the "Go!" button text to indicate changes need to be applied.
         """
-        print("DEBUG: _on_settings_or_file_changed triggered.", file=sys.__stdout__)
+        # print("DEBUG: _on_settings_or_file_changed triggered.", file=sys.__stdout__) # Removed verbose debug
         if self.go_button.text().startswith("Open "):
             self._log_message("Settings or script changed. Resetting Go! button to 'Go!' (processing needed).", "debug")
-            print("DEBUG: Go button text changed from 'Open...' to 'Go!'.", file=sys.__stdout__)
+            # print("DEBUG: Go button text changed from 'Open...' to 'Go!'.", file=sys.__stdout__) # Removed verbose debug
             self.go_button.setText("Go!")
             
-        # Ensure the Go button is enabled if a file is loaded
         self.go_button.setEnabled(self.original_gcode_filepath is not None)
-        print(f"DEBUG: Go button enabled: {self.go_button.isEnabled()} (File loaded: {self.original_gcode_filepath is not None}).", file=sys.__stdout__)
+        # print(f"DEBUG: Go button enabled: {self.go_button.isEnabled()} (File loaded: {self.original_gcode_filepath is not None}).", file=sys.__stdout__) # Removed verbose debug
         
-        # The GCodeViewer is *not* automatically redrawn here. It will redraw
-        # when a new file is loaded, or when the "Go!" button is clicked.
 
     def _update_view_mode(self, selected_text):
         """
         Updates the GCodeViewer's view mode based on the selected text in the combo box.
         """
-        print(f"DEBUG: View mode changed to: '{selected_text}'.", file=sys.__stdout__)
+        # print(f"DEBUG: View mode changed to: '{selected_text}'.", file=sys.__stdout__) # Removed verbose debug
         mode = 'top' # Default
         if "Front View" in selected_text:
             mode = 'front'
@@ -1420,19 +1456,16 @@ class PrintPathApp(QMainWindow):
         self.gcode_viewer.set_view_mode(mode)
         self.current_settings["preview_view_mode"] = selected_text
         save_settings(self.current_settings)
-        self._log_message(f"Preview view mode set to: '{mode}'.", "debug")
+        # self._log_message(f"Preview view mode set to: '{mode}'.", "debug") # Removed verbose debug
 
-        # Also re-draw the viewer with the current data in the new view mode
         if self.original_gcode_filepath and self.gcode_toolpath_data:
-            print("DEBUG: Re-drawing GCodeViewer with current data due to view mode change.", file=sys.__stdout__)
-            # Pass bed dimensions and max_z again to ensure viewer uses them for scaling
+            # print("DEBUG: Re-drawing GCodeViewer with current data due to view mode change.", file=sys.__stdout__) # Removed verbose debug
             detected_max_z = self.gcode_info_full_data.get("max_z", 250.0)
             self.gcode_viewer.set_bed_dimensions(self.gcode_bed_dimensions['x'], self.gcode_bed_dimensions['y'], detected_max_z)
             self.gcode_viewer.set_gcode_data(self.gcode_toolpath_data)
-            self.gcode_viewer.set_layer_start_points(self.gcode_layer_start_points) # Pass layer start points
-            # No longer passing processed_snapshot_points directly from here, it's parsed by viewer
-        else:
-            print("DEBUG: No G-code data to re-draw for viewer after view mode change.", file=sys.__stdout__)
+            self.gcode_viewer.set_layer_start_points(self.gcode_layer_start_points)
+        # else: # Removed verbose debug
+            # print("DEBUG: No G-code data to re-draw for viewer after view mode change.", file=sys.__stdout__) # Removed verbose debug
 
 
     def _auto_save_processed_gcode(self, original_filepath, mode):
@@ -1441,12 +1474,12 @@ class PrintPathApp(QMainWindow):
         in the same directory as the original file, without a file dialog.
         Returns the path of the saved file or None on failure.
         """
-        print(f"DEBUG: Attempting auto-save for processed G-code. Original: {original_filepath}, Mode: {mode}", file=sys.__stdout__)
+        # print(f"DEBUG: Attempting auto-save for processed G-code. Original: {original_filepath}, Mode: {mode}", file=sys.__stdout__) # Removed verbose debug
         if self.processed_gcode_content is None:
-            self._log_message("No G-code has been processed yet to save automatically.", "debug")
+            # self._log_message("No G-code has been processed yet to save automatically.", "debug") # Removed verbose debug
             return None
         if not original_filepath:
-            self._log_message("Cannot auto-save: Original G-code file path is unknown.", "debug")
+            # self._log_message("Cannot auto-save: Original G-code file path is unknown.", "debug") # Removed verbose debug
             return None
 
         base_dir = os.path.dirname(original_filepath)
@@ -1460,7 +1493,7 @@ class PrintPathApp(QMainWindow):
             with open(filepath, "w") as f:
                 f.write(self.processed_gcode_content)
             self._log_message(f"Processed G-code automatically saved to: {filepath}", "info")
-            print(f"INFO: Processed G-code automatically saved to: {filepath}", file=sys.__stdout__)
+            # print(f"INFO: Processed G-code automatically saved to: {filepath}", file=sys.__stdout__) # Removed verbose debug
             return filepath
         except Exception as e:
             self._log_message(f"Error auto-saving G-code to {filepath}: {e}", "error")
@@ -1472,7 +1505,7 @@ class PrintPathApp(QMainWindow):
         Automatically saves the currently processed G-code content to a derived filename
         in the same directory as the original file, without a file dialog.
         """
-        print("DEBUG: Save processed G-code triggered (auto-save variant).", file=sys.__stdout__)
+        # print("DEBUG: Save processed G-code triggered (auto-save variant).", file=sys.__stdout__) # Removed verbose debug
         if self.processed_gcode_content is None:
             self._log_message("No G-code has been processed yet to save.", "warning")
             return
@@ -1490,7 +1523,7 @@ class PrintPathApp(QMainWindow):
         Saves the currently processed G-code content to a user-specified file location,
         suggesting a default filename based on the original file and current mode.
         """
-        print("DEBUG: Save processed G-code As... dialog initiated.", file=sys.__stdout__)
+        # print("DEBUG: Save processed G-code As... dialog initiated.", file=sys.__stdout__) # Removed verbose debug
         if self.processed_gcode_content is None:
             self._log_message("No G-code has been processed yet to save.", "warning")
             return
@@ -1510,7 +1543,7 @@ class PrintPathApp(QMainWindow):
                 with open(filepath, "w") as f:
                     f.write(self.processed_gcode_content)
                 self._log_message(f"Processed G-code saved to: {filepath}", "info")
-                print(f"INFO: Processed G-code saved to: {filepath}", file=sys.__stdout__)
+                # print(f"INFO: Processed G-code saved to: {filepath}", file=sys.__stdout__) # Removed verbose debug
                 self.save_action.setEnabled(False)
                 self.save_as_action.setEnabled(False)
             except Exception as e:
@@ -1518,16 +1551,16 @@ class PrintPathApp(QMainWindow):
                 print(f"ERROR: Error saving G-code: {e}", file=sys.__stdout__)
         else:
             self._log_message("Save As operation cancelled.", "info")
-            print("INFO: Save As operation cancelled.", file=sys.__stdout__)
+            # print("INFO: Save As operation cancelled.", file=sys.__stdout__) # Removed verbose debug
 
     def _update_setting(self, key, value):
         """
         Updates a specific GLOBAL setting in the self.current_settings dictionary.
         Also saves settings automatically.
         """
-        print(f"DEBUG: Updating global setting '{key}' to: {value}", file=sys.__stdout__)
+        # print(f"DEBUG: Updating global setting '{key}' to: {value}", file=sys.__stdout__) # Removed verbose debug
         self.current_settings[key] = value
-        self._log_message(f"Global Setting '{key}' updated to: {value}", "debug")
+        # self._log_message(f"Global Setting '{key}' updated to: {value}", "debug") # Removed verbose debug
         save_settings(self.current_settings) 
         self._on_settings_or_file_changed() 
 
@@ -1537,11 +1570,11 @@ class PrintPathApp(QMainWindow):
         Updates a specific SCRIPT-SPECIFIC setting in the nested self.current_settings dictionary.
         Also saves settings automatically.
         """
-        print(f"DEBUG: Updating script-specific setting '{script_name}.{key}' to: {value}", file=sys.__stdout__)
+        # print(f"DEBUG: Updating script-specific setting '{script_name}.{key}' to: {value}", file=sys.__stdout__) # Removed verbose debug
         if script_name not in self.current_settings:
             self.current_settings[script_name] = {}
         self.current_settings[script_name][key] = value
-        self._log_message(f"Script '{script_name}' setting '{key}' updated to: {value}", "debug")
+        # self._log_message(f"Script '{script_name}' setting '{key}' updated to: {value}", "debug") # Removed verbose debug
         save_settings(self.current_settings) 
         self._on_settings_or_file_changed() 
 
@@ -1549,7 +1582,7 @@ class PrintPathApp(QMainWindow):
         """
         Attempts to open the processed G-code file with the system's default application.
         """
-        print(f"DEBUG: Attempting to open processed file: {self.output_filepath}", file=sys.__stdout__)
+        # print(f"DEBUG: Attempting to open processed file: {self.output_filepath}", file=sys.__stdout__) # Removed verbose debug
         if self.output_filepath and os.path.exists(self.output_filepath):
             try:
                 if sys.platform.startswith('darwin'):    
@@ -1559,13 +1592,14 @@ class PrintPathApp(QMainWindow):
                 else:                                    
                     os.system(f'xdg-open "{self.output_filepath}"')
                 self._log_message(f"Opened '{os.path.basename(self.output_filepath)}' with default application.", "info")
-                print(f"INFO: Opened '{os.path.basename(self.output_filepath)}' with default application.", file=sys.__stdout__)
+                # print(f"INFO: Opened '{os.path.basename(self.output_filepath)}' with default application.", file=sys.__stdout__) # Removed verbose debug
             except Exception as e:
                 self._log_message(f"Error opening processed file with default app: {e}", "error")
                 print(f"ERROR: Error opening processed file with default app: {e}", file=sys.__stdout__)
         else:
-            self._log_message("No processed file available to open.", "debug")
-            print("DEBUG: No processed file available to open.", file=sys.__stdout__)
+            # self._log_message("No processed file available to open.", "debug") # Removed verbose debug
+            # print("DEBUG: No processed file available to open.", file=sys.__stdout__) # Removed verbose debug
+            pass
 
 
 # --- Main Application Entry Point ---
@@ -1585,25 +1619,43 @@ if __name__ == "__main__":
             with open(filepath, "r") as f:
                 gcode_lines = f.readlines()
             
-            # Use the globally captured ORIGINAL_STDOUT and ORIGINAL_STDERR for CLI redirection
             sys.stdout = StreamRedirect(lambda msg, type: ORIGINAL_STDOUT.write(f"[{type.upper()}] {msg}\n"), "debug", ORIGINAL_STDOUT, ORIGINAL_STDERR)
 
-            # In CLI mode, we still need to run parsing logic to get info/toolpath
-            # Since no GUI, we can call directly.
             temp_parse_thread = GCodeParseThread(filepath)
-            # To get results from a QThread without a QApp event loop, we can just call run directly
-            # This is not ideal for GUI apps, but acceptable for a CLI context when simulating.
+            
             dummy_gcode_info = temp_parse_thread._parse_gcode_info_main_app(gcode_lines)
-            dummy_toolpath_data, dummy_layer_start_points = temp_parse_thread._parse_gcode_toolpath(gcode_lines) # Now tuples
+            dummy_toolpath_data, dummy_layer_start_points, dummy_toolpath_bounds = temp_parse_thread._parse_gcode_toolpath(gcode_lines) 
 
-            # Pass the full dummy_gcode_info to cli_settings
             cli_settings.update(dummy_gcode_info)
-            cli_settings["toolpath_data"] = dummy_toolpath_data # This one isn't used by scripts, just viewer
-            cli_settings["layer_start_points"] = dummy_layer_start_points # Pass layer start points
+            cli_settings["toolpath_data"] = dummy_toolpath_data
+            cli_settings["layer_start_points"] = dummy_layer_start_points
 
-            # CLI mode will not have a viewer to display processed snapshot points,
-            # so we still call run_func expecting it to return (lines)
-            # MODIFIED: Expect run_func to return both new_lines and dummy_snapshot_points
+            comment_bbox_width = (cli_settings.get("max_x", 0) - cli_settings.get("min_x", 0))
+            comment_bbox_height = (cli_settings.get("max_y", 0) - cli_settings.get("min_y", 0))
+
+            use_toolpath_for_bbox_cli = False
+            if (cli_settings.get("min_x") is None or comment_bbox_width < MIN_MODEL_DIMENSION_THRESHOLD) or \
+               (cli_settings.get("min_y") is None or comment_bbox_height < MIN_MODEL_DIMENSION_THRESHOLD):
+                use_toolpath_for_bbox_cli = True
+                ORIGINAL_STDOUT.write(f"WARNING: CLI: Comment-based bbox is too small ({comment_bbox_width:.1f}x{comment_bbox_height:.1f}mm) or missing. Prioritizing toolpath bounds.\n")
+
+            if use_toolpath_for_bbox_cli:
+                cli_settings["min_x"] = dummy_toolpath_bounds["min_x_path"]
+                cli_settings["max_x"] = dummy_toolpath_bounds["max_x_path"]
+                cli_settings["min_y"] = dummy_toolpath_bounds["min_y_path"]
+                cli_settings["max_y"] = dummy_toolpath_bounds["max_y_path"]
+                ORIGINAL_STDOUT.write(f"DEBUG: CLI: Overridden model X bounds with toolpath: {cli_settings['min_x']:.1f}:{cli_settings['max_x']:.1f}\n")
+                ORIGINAL_STDOUT.write(f"DEBUG: CLI: Overridden model Y bounds with toolpath: {cli_settings['min_y']:.1f}:{cli_settings['max_y']:.1f}\n")
+
+
+            if cli_settings.get("max_z") is None or cli_settings["max_z"] < dummy_toolpath_bounds["max_z_path"]:
+                cli_settings["max_z"] = dummy_toolpath_bounds["max_z_path"]
+                ORIGINAL_STDOUT.write(f"DEBUG: CLI: Using toolpath max Z for model: {cli_settings['max_z']:.1f}\n")
+
+            # IMPORTANT: Ensure min_z_path is passed in CLI mode as well
+            cli_settings["min_z_print"] = dummy_toolpath_bounds["min_z_path"]
+
+
             new_lines, dummy_snapshot_points = run_func(cli_settings, gcode_lines)
             
             base, ext = os.path.splitext(filepath)
@@ -1612,10 +1664,9 @@ if __name__ == "__main__":
                 f.writelines(new_lines)
             print(f"Processed and saved: {filepath} -> {outpath}")
         except Exception as e:
-            # Use ORIGINAL_STDERR for error messages in CLI mode
             ORIGINAL_STDERR.write(f"Failed to process file in CLI mode: {e}\n")
         finally:
-            sys.stdout = ORIGINAL_STDOUT # Restore stdout
+            sys.stdout = ORIGINAL_STDOUT 
         sys.exit(0)
     else:
         app = QApplication(sys.argv)
