@@ -1,110 +1,16 @@
-PrintPath: G-code Post-Processor for Timelapse Camera Paths
-PrintPath is a desktop application designed to post-process G-code files, enabling the insertion of custom camera movements for creating stunning timelapses of your 3D prints. It features a graphical user interface (GUI) for easy configuration, dynamic script loading for flexible camera paths, and a built-in G-code previewer.
-
-✨ Features
-GUI Interface: User-friendly desktop application built with PyQt5.
-
-Dynamic Script Loading: Easily add and switch between different post-processing scripts.
-
-G-code Previewer: Visualize your print's toolpath and the planned camera snapshot points in 2D (Top/Front views).
-
-Customizable Settings: Adjust global settings (travel speed, dwell time, retraction) and script-specific parameters through the GUI.
-
-Firmware Agnostic: Supports both Klipper and Marlin firmware (configurable per script).
-
-Automatic Saving: Processed G-code files are automatically saved with a descriptive filename.
-
-Extensible: Create your own Python scripts to define unique camera movements.
-
-🚀 Installation
-PrintPath requires Python 3.x and PyQt5.
-
-Clone the repository:
-
-git clone https://github.com/YourGitHubUser/PrintPath.git
+PrintPath: G-code Post-Processor for Timelapse Camera PathsPrintPath is a desktop application designed to post-process G-code files, enabling the insertion of custom camera movements for creating stunning timelapses of your 3D prints. It features a graphical user interface (GUI) for easy configuration, dynamic script loading for flexible camera paths, and a built-in G-code previewer.✨ FeaturesGUI Interface: User-friendly desktop application built with PyQt5.Dynamic Script Loading: Easily add and switch between different post-processing scripts.G-code Previewer: Visualize your print's toolpath and the planned camera snapshot points in 2D (Top/Front views).Customizable Settings: Adjust global settings (travel speed, dwell time, retraction) and script-specific parameters through the GUI.Firmware Agnostic: Supports both Klipper and Marlin firmware (configurable per script).Automatic Saving: Processed G-code files are automatically saved with a descriptive filename.Extensible: Create your own Python scripts to define unique camera movements.🚀 InstallationPrintPath requires Python 3.x and PyQt5.Clone the repository:git clone https://github.com/YourGitHubUser/PrintPath.git
 cd PrintPath
-
-Create a virtual environment (recommended):
-
-python -m venv venv
+Create a virtual environment (recommended):python -m venv venv
 # On Windows:
 venv\Scripts\activate
 # On macOS/Linux:
 source venv/bin/activate
-
-Install dependencies:
-
-pip install PyQt5
-
-Create the scripts directory:
-Ensure there's a folder named scripts in the root directory of the application. This is where your G-code post-processing scripts will reside.
-
-mkdir scripts
-
-Place example scripts:
-Copy the provided example scripts (e.g., orbit.py, arc.py) into the scripts directory.
-
-🏃‍♀️ Usage
-Run the application:
-
-# Ensure your virtual environment is active
+Install dependencies:pip install PyQt5
+Create the scripts directory:Ensure there's a folder named scripts in the root directory of the application. This is where your G-code post-processing scripts will reside.mkdir scripts
+Place example scripts:Copy the provided example scripts (e.g., orbit.py, arc.py) into the scripts directory.🏃‍♀️ UsageRun the application:# Ensure your virtual environment is active
 python main.py
-
-Open a G-code file:
-Go to File > Open G-code... and select your .gcode file. The viewer will parse and display a preview of your print.
-
-Select a Script:
-Choose a post-processing script from the "Select Script" dropdown (e.g., "orbit", "arc"). The available settings on the left panel will dynamically update based on the selected script.
-
-Adjust Settings:
-Modify the global settings (Travel Speed, Dwell Time, Retract Length, Z-Hop Height) and any script-specific settings (e.g., Number of Snapshots, Orbit Radius) to customize your camera path.
-
-Process G-code:
-Click the "Go!" button. The application will process your G-code, inserting the camera movement commands defined by the selected script. A progress bar will indicate activity.
-
-Review and Save:
-After processing, the processed snapshot points will appear in the previewer. The "Go!" button will change to "Open your_file_name_mode.gcode", allowing you to open the processed file directly with your system's default application. You can also manually save the processed G-code via File > Save Processed G-code or File > Save Processed G-code As....
-
-⚙️ Custom Scripts
-PrintPath is designed to be highly extensible through custom Python scripts.
-Each script should be a .py file placed in the scripts directory and must contain:
-
-# SCRIPT_SETTINGS: comment: A JSON string on the first line defining the script's configurable parameters. This allows the GUI to dynamically generate input widgets.
-
-Example format:
-
-# SCRIPT_SETTINGS: {"setting_key": {"type": "spinbox/doublespinbox/combobox", "label": "Display Name", "range": [min, max], "default": value, "step": value, "decimals": int, "items": ["Item1", "Item2"], "tooltip": "Help text"}}
-
-"type": spinbox (integer), doublespinbox (float), combobox (dropdown).
-
-"label": Text displayed in the GUI.
-
-"range": [min, max] for spinboxes.
-
-"default": Default value.
-
-"step": Increment for spinboxes.
-
-"decimals": Number of decimal places for doublespinbox.
-
-"items": List of strings for combobox.
-
-"tooltip": Hover-over help text.
-
-run(settings, gcode_lines) function: This is the main entry point for your script.
-
-settings (dict): A dictionary containing all global settings (e.g., travel_speed, dwell_time, firmware) and your script-specific settings as defined in # SCRIPT_SETTINGS:. It also includes parsed G-code information like min_x, max_x, min_y, max_y, max_z, total_layers, and bed_dimensions.
-
-gcode_lines (list of str): The original G-code content, line by line.
-
-Return Value: The function must return a tuple:
-
-A list of strings representing the modified G-code lines.
-
-A list of (x, y, z) tuples (floats) representing the calculated snapshot locations. These points will be displayed in the GCodeViewer.
-
-Script Example (my_custom_script.py)
-# SCRIPT_SETTINGS: {"my_custom_value": {"type": "spinbox", "label": "My Custom Setting", "range": [1, 10], "default": 5, "tooltip": "A custom setting."}}
+Open a G-code file:Go to File > Open G-code... and select your .gcode file. The viewer will parse and display a preview of your print.Select a Script:Choose a post-processing script from the "Select Script" dropdown (e.g., "orbit", "arc"). The available settings on the left panel will dynamically update based on the selected script.Adjust Settings:Modify the global settings (Travel Speed, Dwell Time, Retract Length, Z-Hop Height) and any script-specific settings (e.g., Number of Snapshots, Orbit Radius) to customize your camera path.Process G-code:Click the "Go!" button. The application will process your G-code, inserting the camera movement commands defined by the selected script. A progress bar will indicate activity.Review and Save:After processing, the processed snapshot points will appear in the previewer. The "Go!" button will change to "Open your_file_name_mode.gcode", allowing you to open the processed file directly with your system's default application. You can also manually save the processed G-code via File > Save Processed G-code or File > Save Processed G-code As....⚙️ Custom ScriptsPrintPath is designed to be highly extensible through custom Python scripts.Each script should be a .py file placed in the scripts directory and must contain:# SCRIPT_SETTINGS: comment: A JSON string on the first line defining the script's configurable parameters. This allows the GUI to dynamically generate input widgets.Example format:# SCRIPT_SETTINGS: {"setting_key": {"type": "spinbox/doublespinbox/combobox", "label": "Display Name", "range": [min, max], "default": value, "step": value, "decimals": int, "items": ["Item1", "Item2"], "tooltip": "Help text"}}
+"type": spinbox (integer), doublespinbox (float), combobox (dropdown)."label": Text displayed in the GUI."range": [min, max] for spinboxes."default": Default value."step": Increment for spinboxes."decimals": Number of decimal places for doublespinbox."items": List of strings for combobox."tooltip": Hover-over help text.run(settings, gcode_lines) function: This is the main entry point for your script.settings (dict): A dictionary containing all global settings (e.g., travel_speed, dwell_time, firmware) and your script-specific settings as defined in # SCRIPT_SETTINGS:. It also includes parsed G-code information like min_x, max_x, min_y, max_y, max_z, total_layers, and bed_dimensions.gcode_lines (list of str): The original G-code content, line by line.Return Value: The function must return a tuple:A list of strings representing the modified G-code lines.A list of (x, y, z) tuples (floats) representing the calculated snapshot locations. These points will be displayed in the GCodeViewer.Script Example (my_custom_script.py)# SCRIPT_SETTINGS: {"my_custom_value": {"type": "spinbox", "label": "My Custom Setting", "range": [1, 10], "default": 5, "tooltip": "A custom setting."}}
 
 import re
 import math
@@ -168,47 +74,4 @@ def run(settings, gcode_lines):
         modified_lines.append(line)
     
     return modified_lines, snapshot_points
-
-🗺️ G-code Viewer
-The integrated G-code viewer provides a real-time visualization of your print.
-
-Toolpath (Cyan): Shows the nozzle's movement during printing.
-
-Layer Start Points (Yellow): Indicates the beginning of each new layer.
-
-Processed Snapshot Points (Magenta): Shows the locations where the active script will trigger a timelapse snapshot.
-
-Views: Switch between "Top View (XY)" and "Front View (XZ)" to inspect your G-code and camera paths from different perspectives.
-
-Navigation:
-
-Pan: Click and drag with the left mouse button.
-
-Zoom: Use the mouse wheel (scroll up to zoom in, down to zoom out).
-
-Reset View: Press R or right-click and select "Reset View" to return to the default zoom and pan.
-
-🤝 Contributing
-PrintPath is currently a personal project. Contributions are welcome under the CC BY-NC-SA 4.0 International license. Feel free to explore the code, create issues for bugs, or suggest features. Pull requests are appreciated, especially for new post-processing scripts or general improvements that align with the project's non-commercial goals.
-
-📧 Contact
-For any inquiries or feedback, please contact Zxodiacx at [your_email@example.com] (replace with your actual email).
-
-⚖️ License
-PrintPath is licensed under the Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International Public License (CC BY-NC-SA 4.0).
-
-You are free to:
-
-Share — copy and redistribute the material in any medium or format.
-
-Adapt — remix, transform, and build upon the material.
-
-Under the following terms:
-
-Attribution — You must give appropriate credit, provide a link to the license, and indicate if changes were made. You may do so in any reasonable manner, but not in any way that suggests the licensor endorses you or your use.
-
-NonCommercial — You may not use the material for commercial purposes.
-
-ShareAlike — If you remix, transform, or build upon the material, you must distribute your contributions under the same license as the original.
-
-For the full legal text of the license, please refer to the LICENSE.txt file in this repository or visit Creative Commons website.
+🗺️ G-code ViewerThe integrated G-code viewer provides a real-time visualization of your print.Toolpath (Cyan): Shows the nozzle's movement during printing.Layer Start Points (Yellow): Indicates the beginning of each new layer.Processed Snapshot Points (Magenta): Shows the locations where the active script will trigger a timelapse snapshot.Views: Switch between "Top View (XY)" and "Front View (XZ)" to inspect your G-code and camera paths from different perspectives.Navigation:Pan: Click and drag with the left mouse button.Zoom: Use the mouse wheel (scroll up to zoom in, down to zoom out).Reset View: Press R or right-click and select "Reset View" to return to the default zoom and pan.🤝 ContributingPrintPath is currently a personal project. Contributions are welcome under the CC BY-NC-SA 4.0 International license. Feel free to explore the code, create issues for bugs, or suggest features. Pull requests are appreciated, especially for new post-processing scripts or general improvements that align with the project's non-commercial goals.📧 ContactFor any inquiries or feedback, please contact Zxodiacx at [your_email@example.com] (replace with your actual email).⚖️ LicensePrintPath is licensed under the Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International Public License (CC BY-NC-SA 4.0).You are free to:Share — copy and redistribute the material in any medium or format.Adapt — remix, transform, and build upon the material.Under the following terms:Attribution — You must give appropriate credit, provide a link to the license, and indicate if changes were made. You may do so in any reasonable manner, but not in any way that suggests the licensor endorses you or your use.NonCommercial — You may not use the material for commercial purposes.ShareAlike — If you remix, transform, or build upon the material, you must distribute your contributions under the same license as the original.For the full legal text of the license, please refer to the LICENSE.txt file in this repository or visit Creative Commons website.
