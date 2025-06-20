@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.swp
+.env
+.venv
+build/
+dist/
+*.egg-info/
+scripts/orbit - Copy.py
+*.gcode
+*.gcode
