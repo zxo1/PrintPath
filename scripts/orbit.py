@@ -69,8 +69,6 @@ def parse_gcode_info(lines):
                     info["max_x"] = max(xs)
                     info["min_y"] = min(ys)
                     info["max_y"] = max(ys)
-                    # if settings.get("debug_mode", False): # Removed verbose debug
-                        # print(f"DEBUG: Orbit Script: Detected object bbox via POLYGON: X[{info['min_x']:.4f}:{info['max_x']:.4f}] Y[{info['min_y']:.4f}:{info['max_y']:.4f}].", file=sys.stdout) # Removed verbose debug
                 except ValueError:
                     if settings.get("debug_mode", False):
                         print(f"DEBUG: Orbit Script: Error parsing POLYGON coordinates in line: {line.strip()}", file=sys.stdout)
@@ -80,13 +78,9 @@ def parse_gcode_info(lines):
         if not bbox_found:
             bbox_match = re.search(r"X:?([-\d.]+)\s*Y:?([-\d.]+)\s*Z:?([-\d.]+)\s*E:?([-\d.]+)\s*([-\d.]+)", line_upper)
             if bbox_match:
-                # This regex is less reliable for general bounding box and more for start/end G-code points.
-                # Prioritize explicit bbox comments if available from slicers.
-                pass # Skipping this as it's often not for model bbox
+                pass 
 
             # More robust bbox comment parsing
-            # Example: ";BOX:MINX:50.0 MINY:50.0 MAXX:150.0 MAXY:150.0 MAXZ:100.0"
-            # Example: "; bounding_box: min_x=10.0 max_x=100.0 min_y=10.0 max_y=100.0 max_z=50.0"
             bbox_coords_match = re.search(r"(?:MINX|min_x)[=:]\s*([-\d.]+)\s*(?:MINY|min_y)[=:]\s*([-\d.]+)\s*(?:MAXX|max_x)[=:]\s*([-\d.]+)\s*(?:MAXY|max_y)[=:]\s*([-\d.]+)\s*(?:MAXZ|max_z)[=:]\s*([-\d.]+)", line, re.IGNORECASE)
             if bbox_coords_match:
                 try:
@@ -96,8 +90,6 @@ def parse_gcode_info(lines):
                     info["max_y"] = float(bbox_coords_match.group(4))
                     info["max_z"] = float(bbox_coords_match.group(5))
                     bbox_found = True
-                    # if settings.get("debug_mode", False): # Removed verbose debug
-                        # print(f"DEBUG: Orbit Script: Detected object bbox: X[{info['min_x']:.4f}:{info['max_x']:.4f}] Y[{info['min_y']:.4f}:{info['max_y']:.4f}] Z_max:{info['max_z']:.4f}.", file=sys.stdout) # Removed verbose debug
                 except ValueError:
                     if settings.get("debug_mode", False):
                         print(f"DEBUG: Orbit Script: Error parsing bbox coordinates in line: {line.strip()}", file=sys.stdout)
@@ -114,8 +106,6 @@ def parse_gcode_info(lines):
 
         # Optimization: If all critical info is found, no need to parse further
         if all(v is not None for v in [info["total_layers"], info["min_x"], info["max_x"], info["min_y"], info["max_y"], info["max_z"]]):
-            # if settings.get("debug_mode", False): # Removed verbose debug
-                # print("DEBUG: Orbit Script: All critical info found in parse_gcode_info. Early exit.", file=sys.stdout) # Removed verbose debug
             break
             
     # Fallback/sanity checks for missing info
@@ -177,16 +167,19 @@ def run(settings, gcode_lines):
 
     # Global position tracking for the original position to return to
     original_pos_x, original_pos_y, original_pos_z = 0.0, 0.0, 0.0
-    last_extruded_e = 0.0 # Initialize last_extruded_e here to prevent NameError
 
     # New tracking variables for layers and snapshots
-    # This will be the sequential layer number based on ';LAYER:X' comments
     current_logical_layer = 0
-    # Store the actual layer numbers where snapshots have been inserted
     layers_with_inserted_snapshots = set() 
     
-    snapshots_taken_count = 0 # This will now be used directly for progress calculation
+    snapshots_taken_count = 0 
     
+    # Flag to indicate if extrusion has started (i.e., we are actively printing)
+    extrusion_has_started = False
+    
+    # New variable to store the actual Z height where the first snapshot is inserted
+    first_snapshot_actual_z = None 
+
     # Extract settings with defaults
     debug_mode = settings.get("debug_mode", False)
     firmware = settings.get("firmware", "klipper").lower()
@@ -207,6 +200,7 @@ def run(settings, gcode_lines):
     
     max_z_print = settings.get("max_z", 250.0) # Max Z of the print itself (from toolpath)
     min_z_print = settings.get("min_z_print", 0.0) # Min Z of the print itself (from toolpath)
+    total_layers_from_settings = settings.get("total_layers", 1) # Total layers reported by slicer
 
     # Calculate center of the bed for the orbit path (assuming model is centered on bed)
     model_center_x = bed_x / 2.0
@@ -221,15 +215,24 @@ def run(settings, gcode_lines):
 
     total_snapshots_to_take = num_orbits * snapshots_per_loop
     
-    # Handle the case where only one snapshot is requested to avoid division by zero
     if total_snapshots_to_take <= 1:
-        # If 0 or 1 snapshot, the progress factor will always be 0 (for 1st/only snapshot)
-        # This will place it at min_z_print.
         if debug_mode: print("DEBUG: Orbit Script: total_snapshots_to_take is 0 or 1. Z-scaling will be fixed to min_z_print.", file=sys.stdout)
-        effective_total_snapshots_for_scaling = 1 # Treat as 1 for scaling (only first point)
+        effective_total_snapshots_for_scaling = 1 
     else:
         effective_total_snapshots_for_scaling = total_snapshots_to_take
 
+    # Calculate desired layer interval for snapshot distribution
+    # This ensures snapshots are spread evenly across the print's *layers*.
+    if total_snapshots_to_take > 1 and total_layers_from_settings > 1:
+        # We want `total_snapshots_to_take` snapshots, meaning `total_snapshots_to_take - 1` intervals.
+        # Distribute these intervals across `total_layers_from_settings`.
+        layer_interval_for_snapshots = float(total_layers_from_settings) / (total_snapshots_to_take - 1)
+    else:
+        layer_interval_for_snapshots = float('inf') # No distribution needed, or only 1 snapshot
+
+    # Initialize the target layer for the *next* snapshot.
+    # It starts at the `first_snapshot_layer`, which is the earliest possible logical layer number a snapshot can occur.
+    next_snapshot_target_logical_layer_float = float(first_snapshot_layer)
 
     # Track the actual Z height for the purpose of detecting *distinct* layer changes.
     current_z_for_distinct_layer_check = -9999.0 
@@ -258,10 +261,14 @@ def run(settings, gcode_lines):
                 if y_str is not None: current_y += float(y_str)
                 if z_str is not None: current_z += float(z_str)
             
-            if e_str is not None:
-                if cmd == "G1": # Only G1 moves are typically for extrusion
-                    last_extruded_e = float(e_str) # This assumes absolute E. For relative E, more complex.
-                else: # G0 moves often don't have E, or E is zero for travel
+            # Detect if extrusion has started (E value in a G1 move)
+            if cmd == "G1" and e_str is not None:
+                try:
+                    e_value = float(e_str)
+                    # Check for a positive extrusion value, indicating actual printing
+                    if e_value > 0.001: 
+                        extrusion_has_started = True
+                except ValueError:
                     pass 
 
         # Check for G90/G91 mode changes
@@ -271,7 +278,6 @@ def run(settings, gcode_lines):
             is_relative = True
 
         # --- Layer Change and Snapshot Trigger Logic ---
-        # A flag to know if this line represents a change to a new logical layer
         is_new_logical_layer = False
 
         # 1. Prioritize explicit layer comments (e.g., ";LAYER:123")
@@ -292,27 +298,45 @@ def run(settings, gcode_lines):
                     pass 
         
         # Snapshot insertion condition:
-        # Only insert if it's a new logical layer, above the first_snapshot_layer,
-        # and we haven't already inserted a snapshot for this logical layer,
-        # AND we still have snapshots left to take.
-        if is_new_logical_layer and current_logical_layer >= first_snapshot_layer and \
+        # ONLY insert if ALL conditions are met:
+        # 1. A new logical layer is detected.
+        # 2. The current logical layer is at or beyond the first_snapshot_layer setting.
+        # 3. A snapshot hasn't already been inserted for this logical layer (prevents duplicates).
+        # 4. We still have snapshots left to take.
+        # 5. Extrusion has already begun (ensures hotend is ready and print has started).
+        # 6. Current Z is at or above the minimum Z of the actual print toolpath.
+        # 7. Current logical layer is at or past the calculated target for the next snapshot.
+        if is_new_logical_layer and \
+           current_logical_layer >= first_snapshot_layer and \
            current_logical_layer not in layers_with_inserted_snapshots and \
-           snapshots_taken_count < total_snapshots_to_take:
+           snapshots_taken_count < total_snapshots_to_take and \
+           extrusion_has_started and \
+           current_z >= min_z_print and \
+           current_logical_layer >= next_snapshot_target_logical_layer_float: # <-- NEW condition for distribution
+
+            # Capture the actual Z of the first snapshot inserted for scaling reference
+            if first_snapshot_actual_z is None:
+                first_snapshot_actual_z = current_z
+                if debug_mode: print(f"DEBUG: Orbit Script: First snapshot Z captured at {first_snapshot_actual_z:.2f}", file=sys.stdout)
 
             # Calculate the progress factor based on the number of snapshots taken so far
-            # This ensures even distribution in Z regardless of actual layer count
             if effective_total_snapshots_for_scaling <= 1:
-                progress_factor = 0.0 # For 0 or 1 snapshot, it's always at the start (min_z_print)
+                progress_factor = 0.0 
             else:
                 progress_factor = float(snapshots_taken_count) / (effective_total_snapshots_for_scaling - 1)
             
             # --- Scaled Z Height Calculation ---
-            z_range_actual = max_z_print - min_z_print
-            if z_range_actual < 0.1: # Handle very thin prints or no Z movement gracefully
-                snapshot_base_z = min_z_print # Stay at the base Z
+            # Use first_snapshot_actual_z as the effective minimum for scaling
+            # if it has been set. Otherwise, default to min_z_print.
+            effective_start_z_for_scaling = first_snapshot_actual_z if first_snapshot_actual_z is not None else min_z_print
+            
+            # Calculate the Z range for scaling, ensuring it's not zero or negative.
+            if max_z_print - effective_start_z_for_scaling < 0.1: 
+                z_range_for_scaling = 0.1 # A minimal positive range to avoid division by zero or errors
+                snapshot_base_z = effective_start_z_for_scaling # Just keep it at the effective start Z
             else:
-                # Scale the base Z from min_z_print to max_z_print using the progress factor
-                snapshot_base_z = min_z_print + (z_range_actual * progress_factor)
+                z_range_for_scaling = max_z_print - effective_start_z_for_scaling
+                snapshot_base_z = effective_start_z_for_scaling + (z_range_for_scaling * progress_factor)
 
             # The final safe Z position for the camera, incorporating hop and user offset.
             safe_z_for_snapshot = snapshot_base_z + z_hop_height + z_offset_for_snapshots
@@ -324,19 +348,22 @@ def run(settings, gcode_lines):
             target_x = model_center_x + corkscrew_radius * math.cos(angle_rad)
             target_y = model_center_y + corkscrew_radius * math.sin(angle_rad)
             
-            final_gcode.append(f"; --- PrintPath Corkscrew Snapshot for Layer {current_logical_layer} (Z={current_z:.2f}, Scaled Snapshot Z={safe_z_for_snapshot:.2f}) ---\n")
+            final_gcode.append(f"; --- PrintPath Corkscrew Snapshot for Layer {current_logical_layer} (Current Z={current_z:.2f}, Scaled Snapshot Z={safe_z_for_snapshot:.2f}) ---\n")
             final_gcode.append(f"G90 ; Set to Absolute positioning (for move)\n") 
             final_gcode.append(f"G0 X{target_x:.3f} Y{target_y:.3f} Z{safe_z_for_snapshot:.3f} F{travel_speed} ; Move to corkscrew snapshot position\n")
             
+            final_gcode.append("M400\n") 
+            final_gcode.append("TIMELAPSE_TAKE_FRAME\n")            
             if dwell_time > 0:
                 final_gcode.append(f"G4 P{dwell_time} ; Dwell for camera\n")
             
-            final_gcode.append("TIMELAPSE_TAKE_FRAME\n")
+
             
             snapshot_points_list.append((target_x, target_y, safe_z_for_snapshot)) 
 
             final_gcode.append(f"G0 X{original_pos_x:.3f} Y{original_pos_y:.3f} Z{original_pos_z:.3f} F{travel_speed} ; Return to original print position\n")
             
+            # Add retract/unretract commands only if retract_length > 0
             if retract_length > 0:
                 final_gcode.append(f"G91 ; Set to Relative positioning (for unretraction)\n")
                 final_gcode.append(f"G1 E{retract_length:.3f} F{retract_speed * 60:.0f} ; Unretract {retract_length}mm\n")
@@ -344,9 +371,16 @@ def run(settings, gcode_lines):
             
             final_gcode.append(f"; --- END PrintPath Corkscrew Snapshot for Layer {current_logical_layer} ---\n")
         
-            snapshots_taken_count += 1 # Increment the count *after* a snapshot is successfully inserted
+            snapshots_taken_count += 1 
             layers_with_inserted_snapshots.add(current_logical_layer) 
-            if debug_mode: print(f"DEBUG: Orbit Script: Inserted snapshot for logical layer {current_logical_layer} (Z={current_z:.2f}). Total snapshots taken: {snapshots_taken_count}/{total_snapshots_to_take}", file=sys.stdout)
+            
+            # Update the target for the *next* snapshot only if we successfully inserted one and more are needed
+            if snapshots_taken_count < total_snapshots_to_take: 
+                next_snapshot_target_logical_layer_float += layer_interval_for_snapshots
+                # Ensure the target doesn't go too far beyond the total layers due to float accumulation
+                next_snapshot_target_logical_layer_float = min(next_snapshot_target_logical_layer_float, float(total_layers_from_settings) + 1.0) 
+
+            if debug_mode: print(f"DEBUG: Orbit Script: Inserted snapshot for logical layer {current_logical_layer} (Z={current_z:.2f}). Total snapshots taken: {snapshots_taken_count}/{total_snapshots_to_take}. Next target layer: {next_snapshot_target_logical_layer_float:.2f}", file=sys.stdout)
         
         final_gcode.append(line) 
 
